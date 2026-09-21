@@ -1,0 +1,39 @@
+{
+  "name": "nightshift",
+  "version": "2.0.0",
+  "description": "Self-hosted message scheduler for Claude, OpenAI and Gemini. Queue messages for a set time or the moment your usage limit resets, with a REST API for orchestration.",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/parse-limit.test.js test/api.test.js",
+    "check": "node --check server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "multer": "^2.0.2"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "openai",
+    "gemini",
+    "scheduler",
+    "self-hosted",
+    "rate-limit",
+    "llm",
+    "automation",
+    "queue"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/whereixuezugi/nightshift.git"
+  },
+  "homepage": "https://github.com/whereixuezugi/nightshift#readme",
+  "bugs": "https://github.com/whereixuezugi/nightshift/issues"
+}

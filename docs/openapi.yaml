@@ -1,0 +1,605 @@
+openapi: 3.1.0
+info:
+  title: Nightshift API
+  version: "2.0.0"
+  summary: Queue messages for Claude, OpenAI and Gemini, to send later or when a usage limit resets.
+  description: |
+    Everything the Nightshift web app does goes through this API. The browser uses a
+    session cookie; other tools use an API token created in Settings.
+
+    Request bodies accept snake_case or camelCase. Responses are camelCase.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:8787
+    description: Default local install
+security:
+  - bearerToken: []
+
+tags:
+  - name: Service
+  - name: Conversations
+  - name: Sessions
+  - name: Attachments
+  - name: Messages
+
+paths:
+  /healthz:
+    get:
+      tags: [Service]
+      summary: Liveness, no authentication
+      security: []
+      responses:
+        "200": { description: "The service is up" }
+
+  /v1/ping:
+    get:
+      tags: [Service]
+      summary: Version and clock
+      responses:
+        "200":
+          description: Service details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  name: { type: string }
+                  version: { type: string }
+                  api: { type: string }
+                  now: { type: integer, description: "Server time in epoch milliseconds" }
+
+  /v1/providers:
+    get:
+      tags: [Service]
+      summary: Providers, their readiness, capabilities and current limits
+      responses:
+        "200":
+          description: One entry per provider
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Provider" }
+
+  /v1/models:
+    get:
+      tags: [Service]
+      summary: Models the provider reports
+      parameters:
+        - { name: provider, in: query, required: true, schema: { $ref: "#/components/schemas/ProviderId" } }
+      responses:
+        "200":
+          description: Model list, empty when the provider has no key
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    name: { type: string }
+
+  /v1/limits/{provider}/clear:
+    post:
+      tags: [Service]
+      summary: Declare a limit over and release everything waiting on it
+      parameters:
+        - { name: provider, in: path, required: true, schema: { $ref: "#/components/schemas/ProviderId" } }
+      responses:
+        "200": { description: "Cleared" }
+
+  /v1/conversations:
+    get:
+      tags: [Conversations]
+      summary: List conversations
+      parameters:
+        - { name: provider, in: query, schema: { $ref: "#/components/schemas/ProviderId" } }
+      responses:
+        "200":
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Conversation" }
+    post:
+      tags: [Conversations]
+      summary: Create a conversation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider]
+              properties:
+                provider: { $ref: "#/components/schemas/ChatProviderId" }
+                title: { type: string }
+                model: { type: string }
+                system: { type: string, description: "System prompt used for the whole conversation" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conversation" }
+
+  /v1/conversations/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Conversations]
+      summary: One conversation with its messages
+      responses:
+        "200":
+          description: Conversation and history
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Conversation"
+                  - type: object
+                    properties:
+                      messages:
+                        type: array
+                        items: { $ref: "#/components/schemas/StoredMessage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Conversations]
+      summary: Rename, or change the model or system prompt
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                model: { type: string }
+                system: { type: string }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Conversation" }
+    delete:
+      tags: [Conversations]
+      summary: Delete it and cancel anything queued for it
+      responses:
+        "200": { description: "Deleted" }
+
+  /v1/sessions:
+    get:
+      tags: [Sessions]
+      summary: Claude Code sessions found on this machine
+      responses:
+        "200":
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string }
+                    cwd: { type: string }
+                    title: { type: string }
+                    updatedAt: { type: integer }
+
+  /v1/sessions/{id}:
+    get:
+      tags: [Sessions]
+      summary: Transcript of one Claude Code session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Session transcript" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/uploads:
+    post:
+      tags: [Attachments]
+      summary: Upload files
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                files:
+                  type: array
+                  items: { type: string, format: binary }
+      responses:
+        "201":
+          description: Stored attachments
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Attachment" }
+
+  /v1/uploads/base64:
+    post:
+      tags: [Attachments]
+      summary: Upload one file as base64, easier from a script
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, data]
+              properties:
+                name: { type: string }
+                data: { type: string, description: "Base64 file contents" }
+                mime: { type: string }
+      responses:
+        "201":
+          description: Stored attachment
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Attachment" }
+
+  /v1/uploads/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Attachments]
+      summary: Download an attachment
+      responses:
+        "200": { description: "The file" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [Attachments]
+      summary: Delete an attachment no message refers to
+      responses:
+        "200": { description: "Deleted, or kept because it is still in use" }
+
+  /v1/messages:
+    post:
+      tags: [Messages]
+      summary: Queue one message, or a chain that runs in order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MessageRequest" }
+            examples:
+              single:
+                summary: One message, sent now
+                value:
+                  provider: openai
+                  conversation_id: 8f2c…
+                  text: Summarise today's incidents
+              whenLimitResets:
+                summary: A Claude Code chain that starts when the limit resets
+                value:
+                  provider: claude-code
+                  cwd: /srv/projects/api
+                  mode: reset
+                  permission_mode: acceptEdits
+                  webhook_url: https://example.com/hook
+                  messages:
+                    - text: Run the test suite and fix what fails.
+                    - text: Then write the changelog entry.
+      responses:
+        "201":
+          description: The jobs that were created, in order
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/Job" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/jobs:
+    get:
+      tags: [Messages]
+      summary: List queued and finished messages
+      parameters:
+        - { name: status, in: query, schema: { type: string }, description: "Comma separated, or \"active\"" }
+        - { name: provider, in: query, schema: { $ref: "#/components/schemas/ProviderId" } }
+        - { name: conversation_id, in: query, schema: { type: string } }
+        - { name: session_id, in: query, schema: { type: string } }
+        - { name: thread_key, in: query, schema: { type: string } }
+        - { name: since, in: query, schema: { type: integer }, description: "Only jobs updated at or after this epoch ms" }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
+      responses:
+        "200":
+          description: Oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Job" }
+
+  /v1/jobs/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [Messages]
+      summary: One message, optionally waiting for it to finish
+      parameters:
+        - name: wait
+          in: query
+          schema: { type: integer, maximum: 300 }
+          description: Seconds to hold the request open until the message reaches a final state
+      responses:
+        "200":
+          description: The message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Messages]
+      summary: Edit a message that has not been sent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text: { type: string }
+                files: { type: array, items: { type: string } }
+                model: { type: string }
+                effort: { $ref: "#/components/schemas/Effort" }
+                max_tokens: { type: integer }
+                permission_mode: { $ref: "#/components/schemas/PermissionMode" }
+                mode: { $ref: "#/components/schemas/Mode" }
+                run_at: { type: [integer, string] }
+                delay_seconds: { type: integer }
+                retry_on_limit: { type: boolean }
+                webhook_url: { type: string, format: uri }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+    delete:
+      tags: [Messages]
+      summary: Delete a message
+      parameters:
+        - { name: cascade, in: query, schema: { type: boolean, default: true }, description: "Re-link anything chained behind it" }
+        - { name: force, in: query, schema: { type: boolean, default: false }, description: "Cancel it first if it is sending" }
+      responses:
+        "200": { description: "Deleted" }
+
+  /v1/jobs/{id}/cancel:
+    post:
+      tags: [Messages]
+      summary: Stop a message, including one that is sending
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The cancelled message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+
+  /v1/jobs/{id}/retry:
+    post:
+      tags: [Messages]
+      summary: Send now, ignoring a known limit
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The re-queued message
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Job" }
+
+  /v1/events:
+    get:
+      tags: [Service]
+      summary: Server-sent events for jobs, limits and live output
+      parameters:
+        - { name: token, in: query, schema: { type: string }, description: "API token, for clients that cannot set headers" }
+      responses:
+        "200":
+          description: An event stream of job, jobRemoved, limits, live and conversation events
+          content:
+            text/event-stream: {}
+
+components:
+  securitySchemes:
+    bearerToken:
+      type: http
+      scheme: bearer
+      description: An API token created in Settings. `X-API-Key` is also accepted.
+
+  responses:
+    BadRequest:
+      description: The request was rejected, with a readable reason
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such thing
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    ProviderId:
+      type: string
+      enum: [anthropic, claude-code, openai, gemini]
+
+    ChatProviderId:
+      type: string
+      enum: [anthropic, openai, gemini]
+
+    Effort:
+      type: string
+      enum: ["", minimal, low, medium, high, xhigh, max]
+
+    Mode:
+      type: string
+      enum: [now, at, reset, after]
+      description: |
+        now: next tick. at: at run_at. reset: when the provider's limit lifts.
+        after: once the message before it has replied.
+
+    PermissionMode:
+      type: string
+      enum: [default, acceptEdits, plan, auto, bypassPermissions]
+
+    Status:
+      type: string
+      enum: [scheduled, waiting_limit, waiting_step, running, done, failed, cancelled, blocked]
+
+    Provider:
+      type: object
+      properties:
+        id: { $ref: "#/components/schemas/ProviderId" }
+        label: { type: string }
+        kind: { type: string, enum: [chat, agent] }
+        ready: { type: boolean }
+        efforts: { type: array, items: { type: string } }
+        caps:
+          type: object
+          properties:
+            image: { type: boolean }
+            pdf: { type: boolean }
+            video: { type: string, enum: [native, frames, path] }
+            audio: { type: [string, boolean] }
+        limit:
+          type: object
+          properties:
+            limitedUntil: { type: [integer, "null"] }
+            resetKnown: { type: boolean }
+            reason: { type: string, enum: [limit, credit] }
+            message: { type: string }
+        queued: { type: integer }
+
+    Conversation:
+      type: object
+      properties:
+        id: { type: string }
+        provider: { $ref: "#/components/schemas/ChatProviderId" }
+        title: { type: string }
+        model: { type: string }
+        system: { type: string }
+        messageCount: { type: integer }
+        createdAt: { type: integer }
+        updatedAt: { type: integer }
+
+    StoredMessage:
+      type: object
+      properties:
+        role: { type: string, enum: [user, assistant] }
+        text: { type: string }
+        files: { type: array, items: { $ref: "#/components/schemas/Attachment" } }
+        model: { type: string }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+        at: { type: integer }
+        jobId: { type: string }
+
+    Attachment:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        size: { type: integer }
+        mime: { type: string }
+        kind: { type: string, enum: [image, pdf, video, audio, text, binary] }
+
+    MessageRequest:
+      type: object
+      required: [provider]
+      description: Fields at the top level apply to every message; each message may override them.
+      properties:
+        provider: { $ref: "#/components/schemas/ProviderId" }
+        conversation_id: { type: string, description: "Required for chat providers" }
+        session_id: { type: string, description: "Claude Code: resume this session" }
+        cwd: { type: string, description: "Claude Code: the project folder" }
+        thread_key: { type: string, description: "Claude Code: groups messages queued for a session that does not exist yet" }
+        permission_mode: { $ref: "#/components/schemas/PermissionMode" }
+        model: { type: string }
+        effort: { $ref: "#/components/schemas/Effort" }
+        max_tokens: { type: integer }
+        mode: { $ref: "#/components/schemas/Mode" }
+        run_at: { type: [integer, string], description: "Epoch milliseconds or an ISO timestamp" }
+        retry_on_limit: { type: boolean, default: true }
+        webhook_url: { type: string, format: uri }
+        text: { type: string, description: "A single message, as an alternative to messages[]" }
+        files: { type: array, items: { type: string } }
+        messages:
+          type: array
+          items:
+            type: object
+            properties:
+              text: { type: string }
+              files: { type: array, items: { type: string }, description: "Attachment ids" }
+              model: { type: string }
+              effort: { $ref: "#/components/schemas/Effort" }
+              mode: { $ref: "#/components/schemas/Mode" }
+              run_at: { type: [integer, string] }
+              delay_seconds: { type: integer, description: "Wait this long after the previous reply" }
+              webhook_url: { type: string, format: uri }
+
+    Job:
+      type: object
+      properties:
+        id: { type: string }
+        provider: { $ref: "#/components/schemas/ProviderId" }
+        prompt: { type: string }
+        files: { type: array, items: { type: string } }
+        model: { type: string }
+        effort: { $ref: "#/components/schemas/Effort" }
+        maxTokens: { type: integer }
+        mode: { $ref: "#/components/schemas/Mode" }
+        runAt: { type: [integer, "null"] }
+        delayMs: { type: integer }
+        dependsOn: { type: [string, "null"], description: "The message this one waits for" }
+        threadKey: { type: string }
+        conversationId: { type: string }
+        sessionId: { type: [string, "null"] }
+        cwd: { type: string }
+        permissionMode: { $ref: "#/components/schemas/PermissionMode" }
+        retryOnLimit: { type: boolean }
+        webhookUrl: { type: string }
+        source: { type: string, enum: [web, api] }
+        status: { $ref: "#/components/schemas/Status" }
+        attempts: { type: integer }
+        limitWaits: { type: integer }
+        nextAttemptAt: { type: integer }
+        createdAt: { type: integer }
+        startedAt: { type: integer }
+        finishedAt: { type: integer }
+        lastError: { type: [string, "null"] }
+        live: { type: string, description: "Partial output while running" }
+        result:
+          type: object
+          properties:
+            text: { type: string }
+            usage:
+              type: object
+              properties:
+                input_tokens: { type: integer }
+                output_tokens: { type: integer }
+            sessionId: { type: string }
+            costUsd: { type: number }
+            note: { type: string }

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nightshift</title>
+<link rel="icon" href="logo.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<section id="login" class="login" hidden>
+  <form id="loginForm" class="login-card">
+    <h1 class="wordmark">Nightshift</h1>
+    <label>Password <input type="password" id="loginPw" autocomplete="current-password" required></label>
+    <p class="error" id="loginErr" role="alert"></p>
+    <button class="primary" type="submit">Sign in</button>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <header class="top">
+    <button class="ghost narrow-only" id="navToggle" aria-controls="side" aria-expanded="false">Chats</button>
+    <span class="wordmark"><img src="logo.svg" alt="" width="22" height="22">Nightshift</span>
+    <div class="clocks" id="clocks" aria-live="polite"></div>
+    <button class="ghost" id="queueToggle" aria-controls="queue" aria-expanded="false">Queue <span id="queueCount" class="count"></span></button>
+    <button class="ghost" id="settingsBtn">Settings</button>
+  </header>
+
+  <div class="layout">
+    <aside class="side" id="side">
+      <div class="seg wrap" id="providerSeg" role="tablist" aria-label="Where to send"></div>
+      <button class="outline" id="newConvBtn">New conversation</button>
+      <input class="search" id="convSearch" type="search" placeholder="Filter conversations" aria-label="Filter conversations">
+      <nav class="conv-list" id="convList"></nav>
+    </aside>
+
+    <main class="main">
+      <div class="thread-head">
+        <div class="thread-titles">
+          <h1 id="threadTitle">Pick a conversation</h1>
+          <p id="threadSub"></p>
+        </div>
+        <button class="ghost small" id="threadEdit" hidden>Edit</button>
+      </div>
+
+      <div class="thread" id="thread" aria-live="polite"></div>
+
+      <form class="composer" id="composer">
+        <div class="drop-hint" id="dropHint">Drop files to attach</div>
+        <div class="edit-bar" id="editBar" hidden>
+          <span>Editing a queued message</span>
+          <button type="button" class="ghost small" id="cancelEdit">Cancel</button>
+        </div>
+        <ol class="steps" id="steps"></ol>
+        <div class="chips" id="chips"></div>
+        <textarea id="prompt" rows="3" placeholder="Message Claude. Paste or drop images, videos and files." aria-label="Message"></textarea>
+
+        <div class="controls">
+          <label class="attach outline small">Attach files<input type="file" id="fileInput" multiple></label>
+          <label class="field">Model
+            <input id="model" list="modelList" autocomplete="off" spellcheck="false" placeholder="model id">
+          </label>
+          <datalist id="modelList"></datalist>
+          <label class="field">Effort
+            <select id="effort"></select>
+          </label>
+          <label class="field chat-only">Max tokens
+            <input id="maxTokens" type="number" min="256" max="200000" step="256" placeholder="auto">
+          </label>
+          <label class="field agent-only">Permissions
+            <select id="permMode">
+              <option value="default">Ask (read-only when unattended)</option>
+              <option value="acceptEdits">Accept file edits</option>
+              <option value="plan">Plan only</option>
+              <option value="auto">Auto</option>
+              <option value="bypassPermissions">Skip all prompts</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="when">
+          <div class="seg" id="modeSeg" role="radiogroup" aria-label="When to send">
+            <button type="button" role="radio" data-m="now">Now</button>
+            <button type="button" role="radio" data-m="at">At a time</button>
+            <button type="button" role="radio" data-m="reset">When my limit resets</button>
+          </div>
+          <input type="datetime-local" id="runAt" aria-label="Send at" hidden>
+          <label class="check" id="retryWrap"><input type="checkbox" id="retryOnLimit" checked> If a limit blocks it, wait for the reset and send then</label>
+          <button class="outline" id="addStep" type="button">Add follow-up</button>
+          <button class="primary" id="sendBtn" type="submit">Send now</button>
+        </div>
+      </form>
+    </main>
+
+    <aside class="queue" id="queue" aria-label="Queue">
+      <div class="queue-head">
+        <h2>Queue</h2>
+        <button class="ghost small" id="clearDone">Clear finished</button>
+      </div>
+      <div id="jobList" class="job-list"></div>
+    </aside>
+  </div>
+</div>
+
+<dialog id="settingsDlg">
+  <form method="dialog" id="settingsForm">
+    <h2>Settings</h2>
+    <div id="providerSettings"></div>
+    <fieldset>
+      <legend>Claude Code</legend>
+      <label>Path to the claude command <input id="setBin" spellcheck="false"></label>
+      <label>Default project folder <input id="setCwd" spellcheck="false"></label>
+      <label>Stop a run after (minutes) <input id="setTimeout" type="number" min="1" max="720"></label>
+      <p class="hint" id="healthHint"></p>
+    </fieldset>
+    <fieldset>
+      <legend>Waiting for resets</legend>
+      <label>Send this many seconds after a reset <input id="setBuffer" type="number" min="0" max="3600"></label>
+      <label>When the reset time is unknown, check every (minutes) <input id="setPoll" type="number" min="1" max="240"></label>
+    </fieldset>
+    <fieldset>
+      <legend>Notifications</legend>
+      <label>Phone or chat alerts (ntfy, Discord or Slack webhook URL)
+        <input id="setNotify" type="url" placeholder="https://ntfy.sh/your-private-topic"></label>
+      <div class="row">
+        <button type="button" class="outline small" id="testNotify">Send a test</button>
+        <button type="button" class="outline small" id="browserNotify">Allow browser alerts</button>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>API tokens</legend>
+      <p class="hint">Tokens let other tools queue messages through the REST API. A token is shown once, when you create it.</p>
+      <div class="row">
+        <input id="tokenName" placeholder="What is it for? e.g. n8n" aria-label="Token name">
+        <button type="button" class="outline small" id="createToken">Create token</button>
+      </div>
+      <output class="new-token" id="newToken" hidden></output>
+      <div id="tokenList" class="token-list"></div>
+    </fieldset>
+    <p class="error" id="settingsErr" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="ghost" id="logoutBtn" hidden>Sign out</button>
+      <button value="cancel" class="ghost" formnovalidate>Close</button>
+      <button type="button" class="primary" id="saveSettings">Save settings</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="convDlg">
+  <form method="dialog">
+    <h2>Conversation</h2>
+    <label>Title <input id="convTitle"></label>
+    <label>System prompt <textarea id="convSystem" rows="5" placeholder="Optional instructions the model follows for this whole conversation"></textarea></label>
+    <div class="row end">
+      <button type="button" class="danger" id="convDelete">Delete conversation</button>
+      <button value="cancel" class="ghost" formnovalidate>Close</button>
+      <button type="button" class="primary" id="convSave">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="newCcDlg">
+  <form method="dialog">
+    <h2>New Claude Code session</h2>
+    <label>Project folder on the server <input id="newCcCwd" spellcheck="false" required></label>
+    <p class="hint">Claude Code works inside this folder. The session is created when the first message sends.</p>
+    <div class="row end">
+      <button value="cancel" class="ghost" formnovalidate>Cancel</button>
+      <button type="button" class="primary" id="newCcCreate">Start session</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
