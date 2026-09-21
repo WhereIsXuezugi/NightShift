@@ -7,7 +7,6 @@
 
 ### Queue messages for Claude, OpenAI and Gemini. They send at the time you pick, or the moment your usage limit resets.
 
-[![CI](https://github.com/whereixuezugi/nightshift/actions/workflows/ci.yml/badge.svg)](https://github.com/whereixuezugi/nightshift/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-1F8A70)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-4338CA)](https://nodejs.org)
 [![Docker](https://img.shields.io/badge/docker-compose%20ready-4338CA)](docs/getting-started.md#docker)
