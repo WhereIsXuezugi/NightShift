@@ -8,6 +8,7 @@
 | [Claude Code](https://code.claude.com) | The Claude Code provider, which uses your Pro or Max plan |
 | ffmpeg | Video frames, and converting oversized or unusual images |
 | An API key | Each of the Claude API, OpenAI and Gemini providers you want |
+| [Ollama](https://ollama.com) | Local models, with no key |
 
 None of the providers is required. The app runs with whichever ones you set up.
 
@@ -64,6 +65,23 @@ docker compose up -d --build
 > [!IMPORTANT]
 > If `./data` is not writable by the container, run `sudo chown -R 1000:1000 data workspace`.
 
+### Ollama in Docker
+
+Nightshift talks to Ollama natively, with no key. There are two ways to wire it up in Docker.
+
+**Ollama already runs on the host.** Nothing to change: the container reaches it at `http://host.docker.internal:11434`. Ollama listens only on localhost by default, which the container cannot see, so start it with `OLLAMA_HOST=0.0.0.0` (for the systemd service: `sudo systemctl edit ollama`, add `Environment="OLLAMA_HOST=0.0.0.0"` under `[Service]`, then restart it). Keep port 11434 closed in your firewall.
+
+**Run Ollama alongside Nightshift.** Add to `.env`:
+
+```bash
+COMPOSE_PROFILES=ollama
+OLLAMA_BASE_URL=http://ollama:11434
+```
+
+then `docker compose up -d`. Models live in the `ollama` volume. For an NVIDIA GPU, uncomment the `deploy` block in `docker-compose.yml` (it needs the NVIDIA Container Toolkit).
+
+Either way, open **Settings → Ollama**, check it says **Ready**, and pull a model by name. Without Docker, a local Ollama at the default address just works.
+
 ## Signing providers in
 
 ### Claude Code
@@ -84,7 +102,15 @@ Check it worked: **Settings** reports the Claude Code version it found.
 Paste a key into **Settings**, or set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` in the environment. Keys set in Settings are saved in `data/db.json`; keys from the environment are used as-is and shown as "from the environment".
 
 > [!TIP]
-> The OpenAI provider speaks plain Chat Completions, so any compatible service works: OpenRouter, Groq, Together, vLLM, LM Studio, Ollama. Point **Base URL** at it and use its model names.
+> The OpenAI provider speaks plain Chat Completions, so any compatible service works: OpenRouter, Groq, Together, vLLM, LM Studio. Point **Base URL** at it and use its model names. For Ollama, use its own provider instead, which needs no key and can pull models.
+
+### Ollama
+
+Install it from [ollama.com](https://ollama.com), then pull a model from **Settings → Ollama** or with `ollama pull llama3.2`. For Docker, see [Ollama in Docker](#ollama-in-docker) above.
+
+## Bringing in your history
+
+Already have months of conversations elsewhere? **Import** in the sidebar reads the data exports of ChatGPT, Claude, Gemini and AI Studio, and Claude Code session files. See [Usage](usage.md#import-export-and-backup).
 
 ## Your first scheduled message
 

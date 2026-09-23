@@ -12,11 +12,16 @@ flowchart TB
   end
   UI -->|cookie| API
   CLI -->|bearer token| API
-  API[lib/api.js<br/>REST at /v1] --> JOBS[lib/jobs.js<br/>validation, chains, edits]
+  API[lib/api.js<br/>REST at /v1] --> JOBS[lib/jobs.js<br/>validation, chains, repeats, edits]
+  API --> IO[lib/importers.js, lib/exporters.js<br/>import, export, backup]
+  IO --> STORE
   JOBS --> STORE[(lib/store.js<br/>data/db.json)]
   SCHED[lib/scheduler.js<br/>tick every 5s] --> STORE
   SCHED --> PROV[lib/providers/*]
   PROV -->|HTTPS| EXT[Claude / OpenAI / Gemini]
+  PROV -->|HTTP| OLL[Ollama]
+  READY[lib/readiness.js<br/>probe every 60s] --> PROV
+  READY -->|SSE| UI
   PROV -->|spawn| CC[claude -p]
   SCHED -->|SSE| UI
   SCHED -->|webhook, ntfy| CLI
@@ -40,6 +45,9 @@ Queueing a message creates a job. It holds the message, the attachments, the pro
   "conversationId": "…",        // chat providers
   "sessionId": "…", "cwd": "/srv/api", "permissionMode": "acceptEdits",
   "retryOnLimit": true, "webhookUrl": "",
+  "chainId": "uuid shared by every step",
+  "repeat": { "every": "daily", "timezone": "Europe/London" },  // first step only
+  "repeatedBy": "uuid of the next occurrence, once queued",
   "status": "waiting_limit",
   "nextAttemptAt": 1758400000000,
   "attempts": 1, "limitWaits": 1, "transientTries": 0,
@@ -85,6 +93,10 @@ Bare clock times are resolved in the timezone printed alongside them, or the ser
 
 When a limit arrives with no time attached, the provider is marked limited for the polling interval (15 minutes by default) and tried again then, so an unrecognised message costs you a delay rather than a missed send.
 
+### Repeats
+
+A repeat lives on the first job of a chain. When that job settles, done or finally failed, `repeatChain()` in the scheduler copies the whole chain, keeping only what describes the request (text, files, model, effort, where it goes), and schedules the copy's head at `nextOccurrence()` from `lib/time.js`. That function works in wall-clock time in the repeat's timezone, converting back to an instant only at the end, so a 07:00 repeat stays at 07:00 when the clocks change. If several occurrences were missed while the server was down, it lands on the next one still in the future: one catch-up run, not a burst. The original records the copy in `repeatedBy`, which also makes the step idempotent. A Claude Code chain that started a new session gets a fresh thread each time, so each occurrence opens its own session.
+
 ## The provider layer
 
 ```mermaid
@@ -99,8 +111,10 @@ classDiagram
     stream(event) text and usage
     mapError(status, body, headers) kind and resetAt
     dropUnsupported(body, message)
+    listModels() for the dropdown
+    probe() reachable, for keyless providers
   }
-  chat_js --> adapter : anthropic, openai, gemini
+  chat_js --> adapter : anthropic, openai, gemini, ollama
   class claudeCode_js {
     run() spawns claude -p
     listSessions() reads ~/.claude/projects
@@ -108,13 +122,21 @@ classDiagram
   }
 ```
 
-`chat.js` owns everything the three HTTP providers share: turning a stored turn plus its attachments into provider-neutral parts, streaming the response, retrying once without a parameter a model rejects, and classifying errors. Each adapter is about a hundred lines describing only what is different: the URL and headers, how content blocks are shaped, where effort lives, how an error reports a reset.
+`chat.js` owns everything the four HTTP providers share: turning a stored turn plus its attachments into provider-neutral parts, streaming the response (server-sent events, or newline-delimited JSON for Ollama), retrying once without a parameter a model rejects, and classifying errors. Each adapter is about a hundred lines describing only what is different: the URL and headers, how content blocks are shaped, where effort lives, how an error reports a reset.
 
 Adding a provider means writing one adapter and registering it. Nothing else in the app knows the difference.
 
 **Attachments** are prepared per provider from its `caps`. An image too large for the Claude API is downscaled with ffmpeg; a video is turned into evenly spaced frames unless the provider reads video directly, as Gemini does; a text file is inlined in a `<file>` tag; anything unreadable is described in words rather than dropped silently. Frames are cached next to the upload, so a video in a long conversation is only decoded once.
 
 **Claude Code** is not an HTTP API. It is `claude -p --output-format stream-json --verbose`, with the prompt on stdin so length and quoting never matter, plus `--model`, `--effort`, `--resume`, `--permission-mode` and `--add-dir` for attachment folders. Sessions are read straight from the JSONL transcripts in `~/.claude/projects`, so the app shows the same history you see in the terminal, and a scheduled message continues the session you were working in.
+
+**Readiness.** `lib/readiness.js` decides which providers are usable: a key for the API providers, a working `claude --version` for Claude Code, and a successful `probe()` for keyless ones like Ollama. It rechecks every minute and after settings change, and pushes a `providers` event when anything flips, which is how the web app picks the provider to open on and labels each one in Settings.
+
+## Import and export
+
+`lib/importers.js` turns another app's export into Nightshift conversations in two steps. **Parse** reads the upload (zip or JSON, detected by content rather than name) and produces a preview held in memory for 30 minutes, with each conversation checked against `conversation.source` to spot ones already imported. **Commit** writes the chosen ones, copying attachments out of the zip into `data/uploads/` as it goes. Each format has one small parser: ChatGPT's message tree is walked from `current_node` back to the root, so only the branch you last saw comes across; Gemini's Takeout, which records single prompts, is regrouped into conversations by time gap. Claude Code sessions can be installed as real session files under `~/.claude/projects/`, with their working directory rewritten, so Claude Code itself can resume them.
+
+`lib/exporters.js` writes Markdown, JSON and backups by streaming, so exporting a large history does not build it in memory first. Zips are read and written by `lib/zip.js`, about 250 lines with zip64 support, rather than a dependency.
 
 ## Storage
 
@@ -140,6 +162,8 @@ Two ways in, deliberately unequal:
 | `limits` | A provider becomes limited, or the limit clears |
 | `live` | Partial output while a message is being answered, at most every 400 ms |
 | `conversation` | A conversation gained a reply |
+| `providers` | A provider became ready or stopped being ready |
+| `pull` | Progress of an Ollama model download started from Settings |
 
 ## What it deliberately does not do
 

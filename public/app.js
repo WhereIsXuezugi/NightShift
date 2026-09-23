@@ -4,6 +4,9 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const ACTIVE = new Set(['scheduled', 'waiting_limit', 'waiting_step', 'running']);
 const EDITABLE = new Set(['scheduled', 'waiting_limit', 'waiting_step', 'blocked', 'failed', 'cancelled']);
+const CUSTOM = '__custom__';
+const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const REPEAT_TEXT = { daily: 'every day', weekdays: 'every weekday', weekly: 'every week' };
 
 const S = {
   provider: 'anthropic',
@@ -14,6 +17,8 @@ const S = {
   live: {},
   convs: [],
   sessions: [],
+  models: {},          // provider -> [{ id, name }]
+  modelState: {},      // provider -> 'loading' | 'ok' | error message
   drafts: JSON.parse(localStorage.getItem('ns.drafts') || '{}'),
   active: null,        // { provider, kind: 'conv'|'session'|'draft', id, cwd }
   threadData: null,
@@ -48,6 +53,29 @@ function toast(msg) {
   toastTimer = setTimeout(() => (t.hidden = true), 4000);
 }
 
+// The clipboard API only exists on secure pages; a self-hosted app is often
+// reached over plain http on the LAN, so fall back to the old way.
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch {}
+  ta.remove();
+  return ok;
+}
+async function copyFrom(button, text) {
+  const ok = await copyText(text);
+  const label = button.textContent;
+  button.textContent = ok ? 'Copied' : 'Copy failed';
+  button.disabled = true;
+  setTimeout(() => { button.textContent = label; button.disabled = false; }, 1400);
+}
+
 const now = () => Date.now() + S.skew;
 function fmtTime(ts) {
   if (!ts) return '';
@@ -73,7 +101,7 @@ function md(src) {
   return String(src || '').split('```').map((part, i) => {
     if (i % 2) {
       const nl = part.indexOf('\n');
-      return `<pre><code>${esc(nl >= 0 ? part.slice(nl + 1) : part)}</code></pre>`;
+      return `<div class="code"><pre><code>${esc(nl >= 0 ? part.slice(nl + 1) : part)}</code></pre><button type="button" class="ghost small code-copy" data-copy-code>Copy</button></div>`;
     }
     return esc(part)
       .replace(/`([^`\n]+)`/g, '<code>$1</code>')
@@ -87,7 +115,7 @@ const prefsKey = p => `ns.prefs.${p}`;
 const loadPrefs = p => JSON.parse(localStorage.getItem(prefsKey(p)) || '{}');
 function savePrefs() {
   localStorage.setItem(prefsKey(S.provider), JSON.stringify({
-    model: $('#model').value.trim(), effort: $('#effort').value, maxTokens: $('#maxTokens').value, permMode: $('#permMode').value,
+    model: modelValue(), effort: $('#effort').value, maxTokens: $('#maxTokens').value, permMode: $('#permMode').value,
   }));
 }
 const saveDrafts = () => localStorage.setItem('ns.drafts', JSON.stringify(S.drafts));
@@ -134,10 +162,33 @@ async function start() {
   }
   renderProviderTabs();
   setMode('now');
-  const saved = localStorage.getItem('ns.provider');
-  await setProvider(S.providers.some(p => p.id === saved) ? saved : S.providers[0].id);
+  await setProvider(landingProvider());
   renderJobs();
   renderClocks();
+}
+
+/**
+ * Where to open: the provider you used last if it still works; otherwise the
+ * first one that can actually send (a key is set, Ollama answers, Claude Code
+ * is installed), so a new install never opens on a dead end.
+ */
+function landingProvider() {
+  const saved = S.providers.find(p => p.id === localStorage.getItem('ns.provider'));
+  if (saved?.ready) return saved.id;
+  const busy = S.providers.find(p => p.ready && [...S.jobs.values()].some(j => j.provider === p.id && ACTIVE.has(j.status)));
+  const ready = busy || S.providers.find(p => p.ready);
+  return (ready || saved || S.providers[0]).id;
+}
+
+async function refreshProviders() {
+  const list = await http('/v1/providers').catch(() => null);
+  if (!list) return;
+  const wasReady = providerInfo(S.provider).ready;
+  S.providers = list;
+  S.settings.providers = list;
+  renderProviderTabs();
+  renderClocks();
+  if (!wasReady && providerInfo(S.provider).ready) { loadModels(S.provider); if (!S.active) loadThread(); }
 }
 
 function connectEvents() {
@@ -156,6 +207,8 @@ function connectEvents() {
     if (isChat(S.provider)) renderConvList();
     if (S.active?.kind === 'conv') loadThread();
   });
+  es.addEventListener('providers', () => refreshProviders());
+  es.addEventListener('pull', e => onPull(JSON.parse(e.data)));
   es.onopen = () => { if (started) refreshState(); };
 }
 
@@ -218,7 +271,7 @@ $('#clocks').addEventListener('click', async e => {
 // ---------- providers and conversation list ----------
 function renderProviderTabs() {
   $('#providerSeg').innerHTML = S.providers.map(p =>
-    `<button type="button" role="tab" data-p="${p.id}" aria-selected="${p.id === S.provider}" title="${p.ready ? '' : 'Needs an API key'}">${esc(p.label)}${p.ready ? '' : ' <span class="dot-warn" aria-label="needs a key">•</span>'}</button>`).join('');
+    `<button type="button" role="tab" data-p="${p.id}" aria-selected="${p.id === S.provider}" title="${esc(p.ready ? p.status_note || '' : p.status_note || 'Not set up yet')}">${esc(p.label)}${p.ready ? '' : ' <span class="dot-warn" aria-label="not set up">•</span>'}</button>`).join('');
 }
 $('#providerSeg').addEventListener('click', e => {
   const p = e.target.closest('button')?.dataset.p;
@@ -233,11 +286,13 @@ async function setProvider(id) {
   document.body.classList.toggle('kind-agent', info.kind === 'agent');
   renderProviderTabs();
   $('#newConvBtn').textContent = info.kind === 'chat' ? 'New conversation' : 'New session';
+  const who = { anthropic: 'Claude', 'claude-code': 'Claude Code', openai: 'the model', gemini: 'Gemini', ollama: 'your local model' }[id] || info.label;
+  $('#prompt').placeholder = `Message ${who}. Paste or drop images, videos and files.`;
   $('#effort').innerHTML = `<option value="">Model default</option>` +
     (info.efforts || []).map(e => `<option value="${e}">${e[0].toUpperCase()}${e.slice(1)}</option>`).join('');
 
   const prefs = loadPrefs(id);
-  $('#model').value = prefs.model || '';
+  renderModelOptions(prefs.model ?? '');
   $('#effort').value = prefs.effort || '';
   $('#maxTokens').value = prefs.maxTokens || '';
   $('#permMode').value = prefs.permMode || 'default';
@@ -254,14 +309,79 @@ async function setProvider(id) {
   openThread(exists ? last : null);
 }
 
-async function loadModels(id) {
-  try {
-    const models = await http(`/v1/models?provider=${id}`);
-    if (id !== S.provider) return;
-    $('#modelList').innerHTML = models.map(m => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
-    if (!$('#model').value && models.length) $('#model').value = models[0].id;
-  } catch (e) { toast(e.message); }
+// ---------- model picker ----------
+// A dropdown filled from the provider's own model list, with "Custom…" for
+// anything it doesn't list (a model released this morning, a fine-tune, a gateway alias).
+function modelValue() {
+  const v = $('#modelSelect').value;
+  return v === CUSTOM ? $('#modelCustom').value.trim() : v;
 }
+
+function setModel(value) {
+  const info = providerInfo(S.provider);
+  const list = S.models[S.provider] || [];
+  const sel = $('#modelSelect');
+  const custom = $('#modelCustom');
+  if (value && list.some(m => m.id === value)) sel.value = value;
+  else if (value) { sel.value = CUSTOM; custom.value = value; }
+  else if (info.kind === 'agent') sel.value = '';
+  else if (list.length) sel.value = list[0].id;
+  else if (S.modelState[S.provider] === 'loading') sel.value = '';
+  else { sel.value = CUSTOM; custom.value = ''; }
+  syncModelField();
+}
+
+function syncModelField() {
+  const sel = $('#modelSelect');
+  $('#modelCustom').hidden = sel.value !== CUSTOM;
+  const opt = sel.selectedOptions[0];
+  sel.title = sel.value && sel.value !== CUSTOM ? `${opt?.textContent || ''}${opt?.textContent !== sel.value ? ` (${sel.value})` : ''}` : '';
+}
+
+function renderModelOptions(value = modelValue()) {
+  const info = providerInfo(S.provider);
+  const list = S.models[S.provider] || [];
+  const state = S.modelState[S.provider];
+  const opts = [];
+  if (info.kind === 'agent') opts.push('<option value="">Default for your plan</option>');
+  if (!list.length && info.kind === 'chat') {
+    const why = state === 'loading' ? 'Loading models…'
+      : !info.ready ? (info.key_optional ? 'Server not reachable' : 'Add a key to list models')
+      : state && state !== 'ok' ? 'Couldn\'t load the list' : 'No models listed';
+    opts.push(`<option value="" disabled>${esc(why)}</option>`);
+  }
+  opts.push(...list.map(m => `<option value="${esc(m.id)}">${esc(m.name && m.name !== m.id ? `${m.name}` : m.id)}</option>`));
+  opts.push(`<option value="${CUSTOM}">Custom…</option>`);
+  $('#modelSelect').innerHTML = opts.join('');
+  setModel(value);
+  $('#modelRefresh').title = state && !['ok', 'loading'].includes(state) ? state : 'Reload the model list from the provider';
+}
+
+async function loadModels(id, { refresh = false } = {}) {
+  const keep = id === S.provider ? modelValue() : loadPrefs(id).model;
+  S.modelState[id] = 'loading';
+  if (id === S.provider) { renderModelOptions(keep); $('#modelRefresh').classList.add('spinning'); }
+  try {
+    const models = await http(`/v1/models?provider=${encodeURIComponent(id)}${refresh ? '&refresh=true' : ''}`);
+    S.models[id] = models;
+    S.modelState[id] = 'ok';
+    if (refresh && id === S.provider) toast(models.length ? `${models.length} model${models.length === 1 ? '' : 's'} from ${providerInfo(id).label}.` : `${providerInfo(id).label} listed no models.`);
+  } catch (e) {
+    S.modelState[id] = e.message;
+    if (refresh) toast(e.message);
+  }
+  if (id !== S.provider) return;
+  $('#modelRefresh').classList.remove('spinning');
+  renderModelOptions(keep);
+}
+
+$('#modelSelect').addEventListener('change', () => {
+  syncModelField();
+  if ($('#modelSelect').value === CUSTOM) $('#modelCustom').focus();
+  savePrefs();
+});
+$('#modelCustom').addEventListener('change', savePrefs);
+$('#modelRefresh').addEventListener('click', () => loadModels(S.provider, { refresh: true }));
 
 async function loadSessions() {
   S.sessions = await http('/v1/sessions').catch(e => { toast(e.message); return []; });
@@ -286,7 +406,7 @@ function renderConvList() {
   if (isChat(S.provider)) {
     const list = S.convs.filter(c => match(c.title));
     html = list.map(c => `<button class="conv" data-kind="conv" data-id="${c.id}" aria-current="${cur?.kind === 'conv' && cur.id === c.id}">
-      <span class="conv-title">${esc(c.title)}</span><span class="conv-meta">${esc(c.model || 'no model yet')}, ${fmtTime(c.updatedAt)}</span></button>`).join('');
+      <span class="conv-title">${esc(c.title)}</span><span class="conv-meta">${c.source ? `${esc(sourceLabel(c.source.kind))}, ` : ''}${esc(c.model || 'no model yet')}, ${fmtTime(c.updatedAt)}</span></button>`).join('');
     if (!S.convs.length) html = `<p class="empty">No conversations yet. Start one to send or schedule messages.</p>`;
   } else {
     html += ccDrafts().filter(d => match(d.cwd)).map(d =>
@@ -317,7 +437,7 @@ $('#convList').addEventListener('click', e => {
 $('#newConvBtn').addEventListener('click', async () => {
   if (isChat(S.provider)) {
     try {
-      const c = await http('/v1/conversations', { method: 'POST', body: { provider: S.provider, model: $('#model').value.trim() } });
+      const c = await http('/v1/conversations', { method: 'POST', body: { provider: S.provider, model: modelValue() } });
       S.convs.unshift(c);
       renderConvList();
       openThread({ provider: S.provider, kind: 'conv', id: c.id });
@@ -351,9 +471,25 @@ function openThread(item) {
   loadThread();
 }
 
+function setExportLinks(a) {
+  const menu = $('#exportMenu');
+  menu.open = false;
+  menu.hidden = !a || a.kind === 'draft';
+  if (menu.hidden) return;
+  const root = a.kind === 'conv' ? `/v1/conversations/${a.id}` : `/v1/sessions/${encodeURIComponent(a.id)}`;
+  const tz = encodeURIComponent(TZ);
+  $('#exportMd').href = `${root}/export?format=md&tz=${tz}`;
+  $('#exportJson').href = `${root}/export?format=json&tz=${tz}`;
+  $('#exportJsonl').href = `${root}/export?format=jsonl`;
+  $('#exportJsonl').hidden = a.kind !== 'session';
+}
+$('#exportMenu').addEventListener('click', e => { if (e.target.closest('a')) setTimeout(() => ($('#exportMenu').open = false), 0); });
+document.addEventListener('click', e => { if (!e.target.closest('#exportMenu')) $('#exportMenu').open = false; });
+
 async function loadThread() {
   const a = S.active;
   $('#threadEdit').hidden = a?.kind !== 'conv';
+  setExportLinks(a);
   if (!a) {
     $('#threadTitle').textContent = providerInfo(S.provider).label;
     $('#threadSub').textContent = '';
@@ -364,9 +500,12 @@ async function loadThread() {
     if (a.kind === 'conv') {
       const c = await http(`/v1/conversations/${a.id}`);
       if (S.active !== a) return;
+      const opened = S.threadData?.id !== c.id;
       S.threadData = c;
       $('#threadTitle').textContent = c.title;
-      $('#threadSub').textContent = [c.model, c.system ? 'custom system prompt' : ''].filter(Boolean).join(', ');
+      $('#threadSub').textContent = [c.model, c.system ? 'custom system prompt' : '', c.source ? `imported from ${sourceLabel(c.source.kind)}` : ''].filter(Boolean).join(', ');
+      // Carry on with the model the conversation was using.
+      if (opened && c.model && !S.editing) setModel(c.model);
     } else if (a.kind === 'session') {
       const s = await http(`/v1/sessions/${a.id}`);
       if (S.active !== a) return;
@@ -386,10 +525,31 @@ async function loadThread() {
   renderThread();
 }
 
+const SOURCE_LABELS = { chatgpt: 'ChatGPT', claude: 'Claude', gemini: 'Gemini', aistudio: 'AI Studio', 'claude-code': 'Claude Code', nightshift: 'Nightshift' };
+const sourceLabel = k => SOURCE_LABELS[k] || k;
+
 function emptyState() {
   const info = providerInfo(S.provider);
+  const settingsBtn = '<button type="button" class="outline" data-open-settings>Open Settings</button>';
+  if (!S.providers.some(p => p.ready)) {
+    return `<div class="thread-empty welcome"><h2>Set up somewhere to send</h2>
+      <p>Nightshift needs at least one provider before it can queue anything:</p>
+      <ul>
+        <li><strong>Claude Code</strong> uses your Pro or Max plan. Install it on this server and run <code>claude</code> once to sign in.</li>
+        <li><strong>Claude API, OpenAI or Gemini</strong> take an API key, pasted in Settings.</li>
+        <li><strong>Ollama</strong> runs models on your own hardware, with no key. Start it, and point Settings at it if it isn't on this machine.</li>
+      </ul>
+      <p>${settingsBtn} <button type="button" class="ghost" data-open-import>Import old chats</button></p></div>`;
+  }
+  if (info.id === 'ollama' && !info.ready) {
+    return `<div class="thread-empty"><h2>${esc(info.status_note || 'Ollama is not ready')}</h2>
+      <p>${/no models/i.test(info.status_note) ? 'Pull a model from Settings, or run <code>ollama pull llama3.2</code> on the server.' : `Start Ollama, or set its address in Settings. It's looked for at <code>${esc(info.base_url)}</code>.`}</p><p>${settingsBtn}</p></div>`;
+  }
+  if (info.id === 'claude-code' && !info.ready) {
+    return `<div class="thread-empty"><h2>Claude Code isn't installed here</h2><p>${esc(info.status_note)}. Install it with <code>npm install -g @anthropic-ai/claude-code</code>, or set its path in Settings.</p><p>${settingsBtn}</p></div>`;
+  }
   if (info.kind === 'chat' && !info.ready) {
-    return `<div class="thread-empty"><h2>Add your ${esc(info.label)} key</h2><p>Open Settings and paste a key to send messages through ${esc(info.label)}.</p></div>`;
+    return `<div class="thread-empty"><h2>Add your ${esc(info.label)} key</h2><p>Open Settings and paste a key to send messages through ${esc(info.label)}.</p><p>${settingsBtn}</p></div>`;
   }
   return `<div class="thread-empty"><h2>Nothing open</h2><p>Pick a conversation on the left, or start a new one. Queue messages for later and they go out on their own.</p></div>`;
 }
@@ -404,11 +564,13 @@ function fileBadges(files) {
 function renderThread() {
   const d = S.threadData;
   if (!d) return;
-  const html = d.messages.map(m => {
+  const html = d.messages.map((m, i) => {
     if (m.role === 'user') return `<div class="msg user">${fileBadges(m.files)}${md(m.text)}</div>`;
     const tools = m.tools?.length ? `<div class="tools">Used ${esc([...new Set(m.tools)].join(', '))}</div>` : '';
-    const meta = m.usage ? `<div class="msg-meta">${esc(m.model || '')}, ${m.usage.input_tokens ?? '?'} in / ${m.usage.output_tokens ?? '?'} out${m.stopReason === 'max_tokens' ? ', cut off at max tokens' : ''}</div>` : '';
-    return `<div class="msg assistant">${md(m.text)}${tools}${meta}</div>`;
+    const meta = m.usage ? `${esc(m.model || '')}, ${m.usage.input_tokens ?? '?'} in / ${m.usage.output_tokens ?? '?'} out${m.stopReason === 'max_tokens' ? ', cut off at max tokens' : ''}`
+      : m.model ? esc(m.model) : '';
+    const copy = m.text?.trim() ? `<button type="button" class="ghost small" data-copy-msg="${i}">Copy</button>` : '';
+    return `<div class="msg assistant">${md(m.text)}${tools}<div class="msg-foot"><span class="msg-meta">${meta}</span>${copy}</div></div>`;
   }).join('');
   $('#thread').innerHTML = (html || '') + '<div id="pendingWrap"></div>';
   if (!html) $('#thread').insertAdjacentHTML('afterbegin', `<div class="thread-empty"><h2>Empty so far</h2><p>Write below, then send now, pick a time, or queue it for when your limit resets.</p></div>`);
@@ -425,7 +587,7 @@ function belongsToActive(j) {
 
 function statusText(j) {
   switch (j.status) {
-    case 'scheduled': return j.nextAttemptAt > now() + 5000 ? `Sends ${fmtTime(j.nextAttemptAt)}` : 'Up next';
+    case 'scheduled': return j.nextAttemptAt > now() + 5000 ? `Sends ${fmtTime(j.nextAttemptAt)}${j.repeat ? `, then ${REPEAT_TEXT[j.repeat.every]}` : ''}` : 'Up next';
     case 'waiting_step': return 'Waits for the reply before it';
     case 'waiting_limit': {
       const lim = S.limits[j.provider];
@@ -462,7 +624,15 @@ function renderPending() {
     </div>`).join('');
 }
 
-$('#thread').addEventListener('click', e => jobAction(e));
+$('#thread').addEventListener('click', e => {
+  const msg = e.target.closest('[data-copy-msg]');
+  if (msg) return copyFrom(msg, S.threadData?.messages[+msg.dataset.copyMsg]?.text || '');
+  const code = e.target.closest('[data-copy-code]');
+  if (code) return copyFrom(code, code.closest('.code').querySelector('code').textContent);
+  if (e.target.closest('[data-open-settings]')) return openSettings();
+  if (e.target.closest('[data-open-import]')) return openImport();
+  jobAction(e);
+});
 
 function scrollThread(force) {
   const t = $('#thread');
@@ -593,7 +763,8 @@ $('#addStep').addEventListener('click', () => {
 function updateSendLabel() {
   const n = S.steps.length + 1;
   if (S.editing) { $('#sendBtn').textContent = 'Save changes'; return; }
-  const verb = S.mode === 'now' ? 'Send' : S.mode === 'at' ? 'Schedule' : 'Queue for reset';
+  const repeat = S.mode === 'at' && $('#repeat').value;
+  const verb = S.mode === 'now' ? 'Send' : S.mode === 'at' ? (repeat ? `Schedule ${repeat === 'weekdays' ? 'on weekdays' : repeat}` : 'Schedule') : 'Queue for reset';
   $('#sendBtn').textContent = n > 1 ? `${verb} ${n} messages` : (S.mode === 'now' ? 'Send now' : verb);
 }
 
@@ -602,11 +773,13 @@ function startEdit(job) {
   S.editing = job.id;
   $('#editBar').hidden = false;
   $('#prompt').value = job.prompt;
-  $('#model').value = job.model || '';
+  setModel(job.model || '');
   $('#effort').value = job.effort || '';
   if (job.maxTokens) $('#maxTokens').value = job.maxTokens;
   if (job.permissionMode) $('#permMode').value = job.permissionMode;
   setMode(job.mode === 'after' ? 'after' : job.mode);
+  $('#repeat').value = job.repeat?.every || '';
+  $('#repeat').disabled = !!job.dependsOn;
   if (job.mode === 'at' && job.runAt) {
     const d = new Date(job.runAt);
     $('#runAt').value = new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
@@ -620,6 +793,8 @@ function cancelEdit() {
   S.editing = null;
   $('#editBar').hidden = true;
   $('#prompt').value = '';
+  $('#repeat').value = '';
+  $('#repeat').disabled = false;
   setMode('now');
   renderPending();
   updateSendLabel();
@@ -631,6 +806,7 @@ function setMode(m) {
   S.mode = m === 'after' ? 'after' : m;
   document.querySelectorAll('#modeSeg button').forEach(b => b.setAttribute('aria-checked', String(b.dataset.m === S.mode)));
   $('#runAt').hidden = S.mode !== 'at';
+  $('#repeat').hidden = S.mode !== 'at';
   $('#retryWrap').hidden = S.mode === 'reset';
   if (S.mode === 'at' && !$('#runAt').value) {
     const d = new Date(Date.now() + 3600e3);
@@ -640,7 +816,8 @@ function setMode(m) {
   updateSendLabel();
 }
 $('#modeSeg').addEventListener('click', e => { const m = e.target.closest('button')?.dataset.m; if (m) setMode(m); });
-['model', 'effort', 'maxTokens', 'permMode'].forEach(id => $(`#${id}`).addEventListener('change', savePrefs));
+$('#repeat').addEventListener('change', updateSendLabel);
+['effort', 'maxTokens', 'permMode'].forEach(id => $(`#${id}`).addEventListener('change', savePrefs));
 $('#permMode').addEventListener('change', e => {
   if (e.target.value === 'bypassPermissions') toast('Claude Code will run commands and edit files without asking. Use it only in a folder you trust it with.');
 });
@@ -665,12 +842,16 @@ $('#composer').addEventListener('submit', async e => {
 async function saveEdit() {
   const d = currentDraft();
   const patch = {
-    text: d.prompt, model: $('#model').value.trim(), effort: $('#effort').value, mode: S.mode,
+    text: d.prompt, model: modelValue(), effort: $('#effort').value, mode: S.mode,
     runAt: S.mode === 'at' ? new Date($('#runAt').value).getTime() : undefined,
     permissionMode: $('#permMode').value,
   };
   if (d.files.length) patch.files = d.files;
   if ($('#maxTokens').value) patch.maxTokens = +$('#maxTokens').value;
+  if (!S.jobs.get(S.editing)?.dependsOn) {
+    patch.repeat = S.mode === 'at' && $('#repeat').value ? $('#repeat').value : 'none';
+    patch.timezone = TZ;
+  }
   await http(`/v1/jobs/${S.editing}`, { method: 'PATCH', body: patch });
   cancelEdit();
   clearComposer();
@@ -687,9 +868,11 @@ async function sendChain() {
 
   const body = {
     provider: a.provider,
-    model: $('#model').value.trim(),
+    model: modelValue(),
     effort: $('#effort').value,
     retryOnLimit: $('#retryOnLimit').checked,
+    repeat: S.mode === 'at' && $('#repeat').value ? $('#repeat').value : undefined,
+    timezone: TZ,
     messages: messages.map((m, i) => ({
       text: m.prompt,
       files: m.files,
@@ -711,6 +894,7 @@ async function sendChain() {
   for (const j of jobs) S.jobs.set(j.id, j);
   savePrefs();
   S.steps = [];
+  $('#repeat').value = '';
   renderSteps();
   clearComposer();
   renderJobs();
@@ -719,6 +903,7 @@ async function sendChain() {
   const first = jobs[0];
   const many = jobs.length > 1 ? `${jobs.length} messages queued. ` : '';
   if (first.status === 'waiting_limit') toast(`${many}The first sends when the limit resets, ${fmtTime(first.nextAttemptAt)}.`);
+  else if (S.mode === 'at' && first.repeat) toast(`${many}First send ${fmtTime(first.nextAttemptAt)}, then ${REPEAT_TEXT[first.repeat.every]} at that time.`);
   else if (S.mode === 'at') toast(`${many}The first sends ${fmtTime(first.nextAttemptAt)}.`);
   else if (S.mode === 'reset') toast(`${many}It will try now and wait for the reset if you are limited.`);
   else if (many) toast(`${many}They go out one after another.`);
@@ -743,9 +928,11 @@ function renderJobs() {
       <div class="job-top"><span class="job-status">${esc(statusText(j))}</span><span>${j.model ? esc(j.model) : ''}${j.effort ? `, ${esc(j.effort)}` : ''}</span></div>
       <div class="job-prompt">${esc(j.prompt) || '<em>(attachments only)</em>'}</div>
       <button class="job-where" data-open="${j.id}">${esc(jobWhere(j))}${j.dependsOn ? ', in a chain' : ''}${j.source === 'api' ? ', via API' : ''}</button>
+      ${j.repeat && ACTIVE.has(j.status) ? `<div class="job-repeat">Repeats ${esc(REPEAT_TEXT[j.repeat.every])}</div>` : ''}
       ${j.lastError && j.status !== 'done' ? `<div class="job-err">${esc(j.lastError)}</div>` : ''}
       ${j.result?.note ? `<div class="job-where">${esc(j.result.note)}</div>` : ''}
       <div class="job-actions">
+        ${j.repeat && ACTIVE.has(j.status) && j.status !== 'running' ? `<button class="ghost small" data-norepeat="${j.id}" title="Send this one, then stop">Stop repeating</button>` : ''}
         ${EDITABLE.has(j.status) ? `<button class="ghost small" data-editopen="${j.id}">Edit</button>` : ''}
         ${['scheduled', 'waiting_limit', 'waiting_step', 'failed', 'cancelled', 'blocked'].includes(j.status) ? `<button class="ghost small" data-retry="${j.id}">Send now</button>` : ''}
         ${ACTIVE.has(j.status) ? `<button class="ghost small" data-cancel="${j.id}">Cancel</button>` : `<button class="ghost small" data-del="${j.id}">Remove</button>`}
@@ -771,6 +958,7 @@ async function jobAction(e) {
   const d = t.dataset;
   try {
     if (d.retry) await http(`/v1/jobs/${d.retry}/retry`, { method: 'POST' });
+    else if (d.norepeat) { await http(`/v1/jobs/${d.norepeat}`, { method: 'PATCH', body: { repeat: 'none' } }); toast('It sends once more, then stops.'); }
     else if (d.cancel) await http(`/v1/jobs/${d.cancel}/cancel`, { method: 'POST' });
     else if (d.del) {
       await http(`/v1/jobs/${d.del}`, { method: 'DELETE' });
@@ -792,6 +980,180 @@ $('#clearDone').addEventListener('click', async () => {
   renderJobs();
 });
 
+// ---------- import ----------
+const IMP = { preview: null, selected: new Set() };
+
+function openImport() {
+  resetImport();
+  $('#importDlg').showModal();
+  closeDrawers();
+}
+$('#importBtn').addEventListener('click', openImport);
+
+function resetImport() {
+  if (IMP.preview) http(`/v1/import/${IMP.preview.id}`, { method: 'DELETE' }).catch(() => {});
+  IMP.preview = null;
+  IMP.selected = new Set();
+  $('#importPick').hidden = false;
+  $('#importReview').hidden = true;
+  $('#importGo').hidden = true;
+  $('#importBack').hidden = true;
+  $('#importErr').textContent = '';
+  $('#importProgress').hidden = true;
+  $('#importFile').value = '';
+  $('#importFilter').value = '';
+}
+$('#importBack').addEventListener('click', resetImport);
+$('#importDlg').addEventListener('close', () => { if (IMP.preview) resetImport(); });
+
+// XHR rather than fetch, for upload progress: exports with images run to gigabytes.
+function uploadWithProgress(url, form, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.upload.onprogress = e => e.lengthComputable && onProgress(e.loaded / e.total);
+    xhr.onload = () => {
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch {}
+      if (xhr.status === 401) { showLogin(); return reject(new Error('Sign in required.')); }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+      else reject(new Error(data?.error || `Upload failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error('The upload was interrupted.'));
+    xhr.send(form);
+  });
+}
+
+async function startImport(files) {
+  if (!files?.length) return;
+  $('#importErr').textContent = '';
+  const bar = $('#importProgress');
+  bar.hidden = false;
+  bar.value = 0;
+  const form = new FormData();
+  for (const f of files) form.append('files', f, f.name);
+  try {
+    const preview = await uploadWithProgress('/v1/import?preview=true', form, v => { bar.value = v; if (v >= 1) bar.removeAttribute('value'); });
+    IMP.preview = preview;
+    IMP.selected = new Set(preview.conversations.filter(c => !c.alreadyImported).map(c => c.key));
+    renderImportReview();
+  } catch (e) {
+    $('#importErr').textContent = e.message;
+  } finally { bar.hidden = true; }
+}
+$('#importFile').addEventListener('change', e => startImport(e.target.files));
+const drop = $('#importDrop');
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); startImport(e.dataTransfer.files); });
+
+function renderImportReview() {
+  const p = IMP.preview;
+  const sources = p.sources.map(x => x.label).join(' and ');
+  const already = p.conversations.filter(c => c.alreadyImported).length;
+  const isCc = p.sources.some(x => x.id === 'claude-code');
+  $('#importPick').hidden = true;
+  $('#importReview').hidden = false;
+  $('#importBack').hidden = false;
+  $('#importGo').hidden = false;
+
+  let summary = `Found ${p.conversations.length} conversation${p.conversations.length === 1 ? '' : 's'} from ${esc(sources)}.`;
+  if (already) summary += ` ${already} ${already === 1 ? 'is' : 'are'} already here and left unticked.`;
+  if (p.backup) summary += ` The backup also holds ${p.backup.jobs} queued or finished message${p.backup.jobs === 1 ? '' : 's'} and ${p.backup.files} attachment${p.backup.files === 1 ? '' : 's'}; anything still queued comes back cancelled, so nothing sends by surprise.`;
+  $('#importSummary').innerHTML = summary;
+  $('#importWarnings').innerHTML = p.warnings.map(w => `<li>${esc(w)}</li>`).join('');
+
+  // Where the conversations go. "Match" sends ChatGPT to OpenAI, Claude to the Claude API, and so on.
+  const chat = S.providers.filter(x => x.kind === 'chat');
+  $('#importProvider').innerHTML = `<option value="">The matching provider (ChatGPT to OpenAI, Claude to Claude API, Gemini to Gemini)</option>` +
+    chat.map(x => `<option value="${x.id}">${esc(x.label)}</option>`).join('');
+  $('#importProviderWrap').hidden = !!p.backup && !p.conversations.length;
+  $('#importCcTarget').hidden = !isCc;
+  $('#importCwd').value = '';
+  $('#importSettingsWrap').hidden = !p.backup?.hasSettings;
+  $('#importSettings').checked = false;
+  syncImportTarget();
+  renderImportList();
+}
+
+function syncImportTarget() {
+  const cc = !$('#importCcTarget').hidden && document.querySelector('input[name="ccTarget"]:checked')?.value === 'claude-code';
+  $('#importCwdWrap').hidden = !cc;
+  const onlyCc = IMP.preview?.sources.every(x => x.id === 'claude-code');
+  $('#importProviderWrap').hidden = (cc && onlyCc) || (!!IMP.preview?.backup && !IMP.preview.conversations.length);
+}
+$('#importCcTarget').addEventListener('change', syncImportTarget);
+
+function renderImportList() {
+  const q = $('#importFilter').value.trim().toLowerCase();
+  const list = IMP.preview.conversations.filter(c => !q || c.title.toLowerCase().includes(q));
+  $('#importList').innerHTML = list.length ? list.map(c => `<label class="import-row${c.alreadyImported ? ' done' : ''}">
+      <input type="checkbox" data-key="${esc(c.key)}" ${IMP.selected.has(c.key) ? 'checked' : ''}>
+      <span class="import-title">${esc(c.title)}</span>
+      <span class="import-meta">${c.messages} message${c.messages === 1 ? '' : 's'}${c.files ? `, ${c.files} file${c.files === 1 ? '' : 's'}` : ''}, ${c.updatedAt ? new Date(c.updatedAt).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : 'undated'}${c.alreadyImported ? ', already here' : ''}</span>
+    </label>`).join('') : '<p class="empty">Nothing matches that filter.</p>';
+  const all = IMP.preview.conversations;
+  $('#importAll').checked = all.length > 0 && all.every(c => IMP.selected.has(c.key));
+  $('#importAll').indeterminate = IMP.selected.size > 0 && !$('#importAll').checked;
+  const n = IMP.selected.size;
+  $('#importGo').textContent = IMP.preview.backup && !n ? 'Restore backup' : `Import ${n} conversation${n === 1 ? '' : 's'}`;
+  $('#importGo').disabled = !n && !IMP.preview.backup;
+}
+$('#importFilter').addEventListener('input', renderImportList);
+$('#importList').addEventListener('change', e => {
+  const key = e.target.dataset.key;
+  if (!key) return;
+  if (e.target.checked) IMP.selected.add(key); else IMP.selected.delete(key);
+  renderImportList();
+});
+$('#importAll').addEventListener('change', e => {
+  const q = $('#importFilter').value.trim().toLowerCase();
+  for (const c of IMP.preview.conversations) {
+    if (q && !c.title.toLowerCase().includes(q)) continue;
+    if (e.target.checked) IMP.selected.add(c.key); else IMP.selected.delete(c.key);
+  }
+  renderImportList();
+});
+
+$('#importGo').addEventListener('click', async () => {
+  const p = IMP.preview;
+  if (!p) return;
+  const ccTarget = !$('#importCcTarget').hidden ? document.querySelector('input[name="ccTarget"]:checked').value : 'conversations';
+  const body = {
+    keys: [...IMP.selected],
+    provider: $('#importProvider').value || undefined,
+    target: ccTarget,
+    cwd: $('#importCwd').value.trim() || undefined,
+    restoreSettings: $('#importSettings').checked,
+  };
+  $('#importGo').disabled = true;
+  $('#importGo').textContent = 'Importing…';
+  $('#importErr').textContent = '';
+  try {
+    const r = await http(`/v1/import/${p.id}/commit`, { method: 'POST', body });
+    IMP.preview = null;
+    $('#importDlg').close();
+    const parts = [];
+    if (r.conversations.length) parts.push(`${r.conversations.length} conversation${r.conversations.length === 1 ? '' : 's'}`);
+    if (r.sessions.length) parts.push(`${r.sessions.length} Claude Code session${r.sessions.length === 1 ? '' : 's'}`);
+    if (r.restored) parts.push(`the backup (${r.restored.conversations} conversations, ${r.restored.jobs} queue items${r.restored.settings ? ', settings' : ''})`);
+    toast(`${parts.length ? `Imported ${parts.join(' and ')}.` : 'Nothing new to import.'}${r.skipped ? ` ${r.skipped} skipped.` : ''}${r.errors.length ? ` ${r.errors.length} problem${r.errors.length === 1 ? '' : 's'}, see the browser console.` : ''}`);
+    if (r.errors.length) console.warn('Import problems:', r.errors);
+    if (r.restored?.settings) { const st = await http('/api/state'); S.settings = st.settings; S.providers = st.settings.providers; renderProviderTabs(); }
+    const landed = r.sessions.length ? 'claude-code' : r.conversations[0]?.provider;
+    if (landed) {
+      await setProvider(landed);
+      if (r.conversations[0] && landed !== 'claude-code') openThread({ provider: landed, kind: 'conv', id: r.conversations[0].id });
+    } else if (isChat(S.provider)) {
+      S.convs = await http(`/v1/conversations?provider=${S.provider}`).catch(() => S.convs);
+      renderConvList();
+    }
+  } catch (e) {
+    $('#importErr').textContent = e.message;
+    renderImportList();
+  }
+});
+
 // ---------- drawers ----------
 function toggleDrawer(el, btn, force) {
   const open = force ?? !el.classList.contains('open');
@@ -807,22 +1169,69 @@ $('#queueToggle').addEventListener('click', () => {
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawers(); });
 
 // ---------- settings ----------
+const HINTS = {
+  openai: 'Any OpenAI-compatible service works here: OpenRouter, Groq, Together, vLLM, LM Studio.',
+  ollama: 'No key needed for your own Ollama. In Docker, see “Ollama in Docker” in the getting-started guide. A key is only for ollama.com or a server behind an authenticating proxy.',
+};
+
 function renderProviderSettings() {
   $('#providerSettings').innerHTML = S.providers.filter(p => p.kind === 'chat').map(p => `
     <fieldset data-provider="${p.id}">
-      <legend>${esc(p.label)}</legend>
+      <legend>${esc(p.label)} <span class="status ${p.ready ? 'ok' : 'off'}">${esc(p.ready ? p.status_note || 'Ready' : p.status_note || 'Not set up')}</span></legend>
       <label>${esc(p.key_label || 'API key')}
         <input type="password" data-key="${p.id}" autocomplete="off"
-          placeholder="${p.key_set ? `Saved (${esc(p.key_hint)})${p.key_from_env ? ', from the environment' : ''}. Paste to replace.` : 'Not set'}"></label>
-      <label>Base URL <input data-baseurl="${p.id}" spellcheck="false" placeholder="${esc(p.default_base_url)}"></label>
-      <p class="hint">${p.id === 'openai'
-        ? 'Any OpenAI-compatible service works here: OpenRouter, Groq, Together, vLLM, LM Studio, Ollama.'
-        : `Keys come from <a href="${esc(p.console_url)}" target="_blank" rel="noopener">${esc(new URL(p.console_url).host)}</a>.`}</p>
+          placeholder="${p.key_set ? `Saved (${esc(p.key_hint)})${p.key_from_env ? ', from the environment' : ''}. Paste to replace.` : p.key_optional ? 'Not needed for a local server' : 'Not set'}"></label>
+      ${p.key_set && !p.key_from_env ? `<button type="button" class="ghost small start" data-clear-key="${p.id}">Remove the saved key</button>` : ''}
+      <label>${p.id === 'ollama' ? 'Server address' : 'Base URL'} <input data-baseurl="${p.id}" spellcheck="false" placeholder="${esc(p.default_base_url)}"></label>
+      <p class="hint">${HINTS[p.id] || `Keys come from <a href="${esc(p.console_url)}" target="_blank" rel="noopener">${esc(new URL(p.console_url).host)}</a>.`}</p>
+      ${p.id === 'ollama' ? `<div class="row">
+          <input id="pullName" placeholder="Model to pull, e.g. llama3.2 or qwen3:8b" aria-label="Model to pull" spellcheck="false">
+          <button type="button" class="outline small" id="pullBtn">Pull model</button>
+        </div>
+        <p class="hint">Browse models at <a href="https://ollama.com/search" target="_blank" rel="noopener">ollama.com/search</a>.</p>
+        <div class="pull-status" id="pullStatus" hidden><progress max="1" value="0"></progress><span></span></div>` : ''}
     </fieldset>`).join('');
   for (const p of S.providers.filter(p => p.kind === 'chat')) {
     const input = document.querySelector(`[data-baseurl="${p.id}"]`);
     if (input) input.value = p.base_url === p.default_base_url ? '' : p.base_url;
   }
+}
+
+$('#providerSettings').addEventListener('click', async e => {
+  const clear = e.target.closest('[data-clear-key]')?.dataset.clearKey;
+  if (clear) {
+    if (!confirm(`Remove the saved ${providerInfo(clear).label} key?`)) return;
+    try {
+      S.settings = await http('/api/settings', { method: 'PUT', body: { providers: { [clear]: { key: null } } } });
+      S.providers = S.settings.providers;
+      renderProviderSettings();
+      renderProviderTabs();
+      toast('Key removed.');
+    } catch (err) { $('#settingsErr').textContent = err.message; }
+  }
+  if (e.target.closest('#pullBtn')) {
+    const model = $('#pullName').value.trim();
+    if (!model) return $('#pullName').focus();
+    try {
+      await http('/api/ollama/pull', { method: 'POST', body: { model } });
+      onPull({ model, status: 'starting' });
+    } catch (err) { $('#settingsErr').textContent = err.message; }
+  }
+});
+
+function onPull(p) {
+  const box = $('#pullStatus');
+  if (p.done) {
+    toast(p.error ? `Pulling ${p.model} failed: ${p.error}` : `${p.model} is ready.`);
+    if (!p.error) { if (S.provider === 'ollama') loadModels('ollama', { refresh: true }); refreshProviders(); }
+  }
+  if (!box) return;
+  box.hidden = false;
+  const bar = box.querySelector('progress');
+  if (p.total) bar.value = (p.completed || 0) / p.total; else bar.removeAttribute('value');
+  if (p.done) bar.value = p.error ? 0 : 1;
+  const pct = p.total ? `, ${Math.floor(((p.completed || 0) / p.total) * 100)}%` : '';
+  box.querySelector('span').textContent = p.error ? `${p.model}: ${p.error}` : p.done ? `${p.model} is ready.` : `${p.model}: ${p.status || 'working'}${pct}`;
 }
 
 async function renderTokens() {
@@ -850,7 +1259,8 @@ $('#createToken').addEventListener('click', async () => {
   } catch (e) { $('#settingsErr').textContent = e.message; }
 });
 
-$('#settingsBtn').addEventListener('click', async () => {
+$('#settingsBtn').addEventListener('click', () => openSettings());
+async function openSettings() {
   const s = S.settings;
   renderProviderSettings();
   $('#setBin').value = s.claudeBin;
@@ -862,13 +1272,23 @@ $('#settingsBtn').addEventListener('click', async () => {
   $('#settingsErr').textContent = '';
   $('#newToken').hidden = true;
   $('#healthHint').textContent = 'Checking Claude Code…';
-  $('#settingsDlg').showModal();
+  updateBackupLinks();
+  if (!$('#settingsDlg').open) $('#settingsDlg').showModal();
   renderTokens();
   try {
     const h = await http('/api/health');
     $('#healthHint').textContent = `${h.claudeCode.ok ? `Claude Code found (${h.claudeCode.version}).` : `Claude Code not available: ${h.claudeCode.error}.`} ${h.ffmpeg ? 'ffmpeg found, so video and oversized images work.' : 'ffmpeg not found: video frames and image conversion are unavailable.'}`;
   } catch { $('#healthHint').textContent = ''; }
-});
+}
+
+function updateBackupLinks() {
+  const tz = encodeURIComponent(TZ);
+  $('#exportAllJson').href = '/v1/export?format=json&attachments=true';
+  $('#exportAllMd').href = `/v1/export?format=md&tz=${tz}`;
+  $('#backupLink').href = `/api/backup${$('#backupKeys').checked ? '?keys=1' : ''}`;
+}
+$('#backupKeys').addEventListener('change', updateBackupLinks);
+$('#openImport').addEventListener('click', () => { $('#settingsDlg').close(); openImport(); });
 
 $('#saveSettings').addEventListener('click', async () => {
   const providers = {};

@@ -14,7 +14,7 @@ Settings come from three places, in order of precedence: what you save in **Sett
 | `APP_PASSWORD` | none | Password for the web UI. Required for non-local binds |
 | `ALLOW_NO_PASSWORD` | unset | Set to `1` only if something else in front already authenticates. Read [Security](security.md) first |
 | `TRUST_PROXY` | unset | Set to `1` behind a reverse proxy, so HTTPS detection and client IPs work |
-| `TZ` | system | The timezone used to read reset times such as "resets 3am" |
+| `TZ` | system | The timezone used to read reset times such as "resets 3am", and the default for repeating messages |
 
 ### Providers
 
@@ -23,9 +23,11 @@ Settings come from three places, in order of precedence: what you save in **Sett
 | `ANTHROPIC_API_KEY` | none | Claude API key |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | For gateways and proxies |
 | `OPENAI_API_KEY` | none | OpenAI key, or the key of any compatible service |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Point at OpenRouter, Groq, vLLM, Ollama and so on |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Point at OpenRouter, Groq, vLLM, LM Studio and so on |
 | `GEMINI_API_KEY` | none | Google AI Studio key |
 | `GEMINI_BASE_URL` | `https://generativelanguage.googleapis.com/v1beta` | For gateways |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Where Ollama answers. In Docker Compose it defaults to `http://host.docker.internal:11434`, or `http://ollama:11434` with the bundled service |
+| `OLLAMA_API_KEY` | none | Only for an Ollama behind an authenticating proxy, or Ollama's hosted API. A local Ollama needs no key |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI |
 | `CLAUDE_CWD` | your home folder | Default project folder for new Claude Code sessions |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps sessions, read for the session list |
@@ -49,6 +51,8 @@ Settings come from three places, in order of precedence: what you save in **Sett
 | When the reset time is unknown, check every | 15 min | Used when a limit arrives with no reset time |
 | Notification URL | none | Test it with the button next to it |
 | API tokens | none | For the [REST API](api.md). Shown once, stored hashed |
+| Ollama models | none | Pull a model by name, with live progress. Needs a reachable Ollama |
+| Import, export and backup | | See [Usage](usage.md#import-export-and-backup) |
 
 > [!TIP]
 > Set the reset cushion to 0 if you want the first request out the instant the clock flips, and expect the occasional wasted retry.
@@ -73,3 +77,11 @@ data/
 - One conversation: **Edit** in the thread header, then **Delete conversation**.
 - Finished queue items: **Clear finished** in the queue panel.
 - Everything: stop the app and delete `data/`.
+
+## Backups
+
+**Settings → Import, export and backup → Download a backup** saves one zip holding every conversation, the queue, your settings and every attachment. API keys and token hashes are left out unless you tick **Include API keys**, in which case keep the file as carefully as `data/` itself. The same download is `GET /api/backup` (add `?keys=1` for keys); it needs a signed-in session, not an API token.
+
+To restore, drop the zip into **Import**. Conversations keep their ids, so restoring twice does not duplicate anything. Messages that were still queued come back **cancelled**, so nothing fires unexpectedly; open each one and press **Send now** or reschedule it. Settings are only overwritten if you tick **Restore settings too**.
+
+A copy of `data/` taken while the app is stopped is also a complete backup.

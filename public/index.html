@@ -30,7 +30,10 @@
   <div class="layout">
     <aside class="side" id="side">
       <div class="seg wrap" id="providerSeg" role="tablist" aria-label="Where to send"></div>
-      <button class="outline" id="newConvBtn">New conversation</button>
+      <div class="side-actions">
+        <button class="outline" id="newConvBtn">New conversation</button>
+        <button class="ghost" id="importBtn" title="Import chats from ChatGPT, Claude, Gemini, Claude Code or a Nightshift export">Import</button>
+      </div>
       <input class="search" id="convSearch" type="search" placeholder="Filter conversations" aria-label="Filter conversations">
       <nav class="conv-list" id="convList"></nav>
     </aside>
@@ -41,7 +44,17 @@
           <h1 id="threadTitle">Pick a conversation</h1>
           <p id="threadSub"></p>
         </div>
-        <button class="ghost small" id="threadEdit" hidden>Edit</button>
+        <div class="thread-actions">
+          <details class="menu" id="exportMenu" hidden>
+            <summary class="ghost small">Export</summary>
+            <div class="menu-pop" role="menu">
+              <a role="menuitem" id="exportMd" download>Markdown</a>
+              <a role="menuitem" id="exportJson" download>JSON</a>
+              <a role="menuitem" id="exportJsonl" download hidden>Claude Code .jsonl</a>
+            </div>
+          </details>
+          <button class="ghost small" id="threadEdit" hidden>Edit</button>
+        </div>
       </div>
 
       <div class="thread" id="thread" aria-live="polite"></div>
@@ -58,10 +71,16 @@
 
         <div class="controls">
           <label class="attach outline small">Attach files<input type="file" id="fileInput" multiple></label>
-          <label class="field">Model
-            <input id="model" list="modelList" autocomplete="off" spellcheck="false" placeholder="model id">
-          </label>
-          <datalist id="modelList"></datalist>
+          <div class="field model-field">
+            <label for="modelSelect">Model</label>
+            <div class="model-picker">
+              <select id="modelSelect"></select>
+              <input id="modelCustom" autocomplete="off" spellcheck="false" placeholder="Type a model id" aria-label="Custom model id" hidden>
+              <button type="button" class="ghost refresh" id="modelRefresh" title="Reload the model list from the provider" aria-label="Reload the model list">
+                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </div>
+          </div>
           <label class="field">Effort
             <select id="effort"></select>
           </label>
@@ -86,6 +105,12 @@
             <button type="button" role="radio" data-m="reset">When my limit resets</button>
           </div>
           <input type="datetime-local" id="runAt" aria-label="Send at" hidden>
+          <select id="repeat" aria-label="Repeat" hidden>
+            <option value="">Once</option>
+            <option value="daily">Every day</option>
+            <option value="weekdays">Every weekday</option>
+            <option value="weekly">Every week</option>
+          </select>
           <label class="check" id="retryWrap"><input type="checkbox" id="retryOnLimit" checked> If a limit blocks it, wait for the reset and send then</label>
           <button class="outline" id="addStep" type="button">Add follow-up</button>
           <button class="primary" id="sendBtn" type="submit">Send now</button>
@@ -129,6 +154,19 @@
       </div>
     </fieldset>
     <fieldset>
+      <legend>Import, export and backup</legend>
+      <div class="row">
+        <button type="button" class="outline small" id="openImport">Import chats</button>
+        <a class="outline small btn" id="exportAllJson" download>All conversations as JSON</a>
+        <a class="outline small btn" id="exportAllMd" download>All as Markdown (zip)</a>
+      </div>
+      <div class="row">
+        <a class="outline small btn" id="backupLink" download>Download a full backup</a>
+        <label class="check"><input type="checkbox" id="backupKeys"> Include API keys</label>
+      </div>
+      <p class="hint">A backup is one zip with every conversation, the queue, attachments and settings. Restore it with Import chats.</p>
+    </fieldset>
+    <fieldset>
       <legend>API tokens</legend>
       <p class="hint">Tokens let other tools queue messages through the REST API. A token is shown once, when you create it.</p>
       <div class="row">
@@ -168,6 +206,53 @@
     <div class="row end">
       <button value="cancel" class="ghost" formnovalidate>Cancel</button>
       <button type="button" class="primary" id="newCcCreate">Start session</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="importDlg" class="wide">
+  <form method="dialog" id="importForm">
+    <h2>Import chats</h2>
+    <section id="importPick">
+      <p class="hint">Conversations are added next to what you already have. Importing the same export again skips anything already here.</p>
+      <label class="dropzone" id="importDrop">
+        <input type="file" id="importFile" multiple accept=".zip,.json,.jsonl,.html,application/zip,application/json">
+        <span><strong>Choose export files</strong> or drop them here</span>
+        <span class="hint">.zip, .json, .jsonl or .html</span>
+      </label>
+      <progress id="importProgress" max="1" value="0" hidden></progress>
+      <dl class="formats">
+        <dt>ChatGPT</dt><dd>Settings, Data controls, Export data. Upload the zip from the email; images come along.</dd>
+        <dt>Claude</dt><dd>Settings, Privacy, Export data. Upload the zip.</dd>
+        <dt>Gemini</dt><dd>Google Takeout, My Activity, Gemini Apps, in JSON. Upload the zip. Prompts saved from AI Studio work too.</dd>
+        <dt>Claude Code</dt><dd>A session <code>.jsonl</code> from <code>~/.claude/projects</code>, or a zip of that folder.</dd>
+        <dt>Nightshift</dt><dd>A conversation exported as JSON, or a full backup zip.</dd>
+      </dl>
+    </section>
+    <section id="importReview" hidden>
+      <p id="importSummary" class="import-summary"></p>
+      <ul class="warnings" id="importWarnings"></ul>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="importAll"> Select all</label>
+        <input type="search" id="importFilter" placeholder="Filter by title" aria-label="Filter by title">
+      </div>
+      <div class="import-list" id="importList"></div>
+      <fieldset id="importCcTarget" hidden>
+        <legend>Claude Code sessions</legend>
+        <label class="check"><input type="radio" name="ccTarget" value="claude-code" checked> Add to Claude Code's history on this server, so they can be resumed</label>
+        <label class="check"><input type="radio" name="ccTarget" value="conversations"> Import as conversations under a chat provider</label>
+        <label id="importCwdWrap">Folder on this server <input id="importCwd" spellcheck="false" placeholder="Leave empty to keep each session's own folder"></label>
+      </fieldset>
+      <label id="importProviderWrap">Put them under
+        <select id="importProvider"></select>
+      </label>
+      <label class="check" id="importSettingsWrap" hidden><input type="checkbox" id="importSettings"> Also restore settings from the backup</label>
+    </section>
+    <p class="error" id="importErr" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="ghost" id="importBack" hidden>Choose other files</button>
+      <button value="cancel" class="ghost" formnovalidate>Close</button>
+      <button type="button" class="primary" id="importGo" hidden>Import</button>
     </div>
   </form>
 </dialog>

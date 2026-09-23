@@ -9,7 +9,9 @@ import { Events, notify } from './lib/events.js';
 import { Scheduler } from './lib/scheduler.js';
 import { hasFfmpeg } from './lib/media.js';
 import { createApiRouter, API_VERSION } from './lib/api.js';
-import { CHAT_ADAPTERS, PROVIDERS, describeProviders, normalizeProvider, claudeCode as cc } from './lib/providers/index.js';
+import { Readiness } from './lib/readiness.js';
+import { writeBackup } from './lib/exporters.js';
+import { CHAT_ADAPTERS, describeProviders, normalizeProvider, claudeCode as cc } from './lib/providers/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
@@ -82,7 +84,7 @@ function settings() {
 const publicSettings = () => {
   const s = settings();
   return {
-    providers: describeProviders(s),
+    providers: describeProviders(s, readiness.probes),
     claudeBin: s.claudeBin, claudeCwd: s.claudeCwd, notifyUrl: s.notifyUrl,
     resetBufferSec: s.resetBufferSec, pollMinutes: s.pollMinutes, ccTimeoutMin: s.ccTimeoutMin,
     version: pkg.version, authRequired: !!cfg.password,
@@ -90,7 +92,8 @@ const publicSettings = () => {
 };
 
 const scheduler = new Scheduler({ store, events, settings });
-const ctx = { store, events, scheduler, settings, dataDir: cfg.dataDir, version: pkg.version };
+const readiness = new Readiness(settings, events);
+const ctx = { store, events, scheduler, settings, readiness, dataDir: cfg.dataDir, version: pkg.version };
 
 const app = express();
 app.disable('x-powered-by');
@@ -166,15 +169,18 @@ app.use(`/${API_VERSION}`, requireAuth, createApiRouter(ctx));
 const admin = express.Router();
 admin.use(requireAuth, requireSession);
 
-admin.get('/state', (req, res) => res.json({
+admin.get('/state', async (req, res) => {
+  await readiness.refresh({ maxAgeMs: 30000 }).catch(() => {});
+  res.json({
   settings: publicSettings(),
   limits: store.data.limits,
   jobs: Object.values(store.data.jobs),
   live: Object.fromEntries(scheduler.live),
   now: Date.now(),
-}));
+  });
+});
 
-admin.put('/settings', (req, res) => {
+admin.put('/settings', async (req, res) => {
   const b = req.body || {}, s = store.data.settings;
   if (b.providers && typeof b.providers === 'object') {
     s.providers ||= {};
@@ -204,17 +210,74 @@ admin.put('/settings', (req, res) => {
     if (b[k] !== undefined) s[k] = Math.min(max, Math.max(min, Math.round(+b[k] || min)));
   }
   store.save();
+  await readiness.refresh().catch(() => {});
   res.json(publicSettings());
 });
 
 admin.get('/health', async (req, res) => {
   const s = settings();
+  const probes = await readiness.refresh();
   res.json({
     version: pkg.version,
-    claudeCode: await cc.version(s.claudeBin),
+    claudeCode: probes['claude-code'] || await cc.version(s.claudeBin),
+    ollama: probes.ollama || null,
     ffmpeg: await hasFfmpeg(),
-    providers: Object.fromEntries(Object.keys(PROVIDERS).map(id => [id, !!s.providers[id]?.key || id === 'claude-code'])),
+    providers: Object.fromEntries(describeProviders(s, probes).map(p => [p.id, p.ready])),
   });
+});
+
+// Everything in one zip. API keys are included only when asked for.
+admin.get('/backup', async (req, res, next) => {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    res.type('application/zip').set('Content-Disposition', `attachment; filename="nightshift-backup-${day}.zip"`);
+    await writeBackup(res, { store, version: pkg.version, includeKeys: req.query.keys === '1' || req.query.keys === 'true' });
+    res.end();
+  } catch (e) { next(e); }
+});
+
+// Pulls a model onto the Ollama server, reporting progress as "pull" events.
+const pulls = new Map();
+admin.post('/ollama/pull', (req, res) => {
+  const model = String(req.body?.model || '').trim();
+  if (!/^[\w.\-:/]{1,120}$/.test(model)) return res.status(400).json({ error: 'Give a model name, such as "llama3.2" or "qwen3:8b".' });
+  if (pulls.has(model)) return res.status(202).json({ ok: true, model, already: true });
+  const conf = settings().providers.ollama;
+  const controller = new AbortController();
+  pulls.set(model, controller);
+  res.status(202).json({ ok: true, model });
+  (async () => {
+    const send = data => events.send('pull', { model, ...data });
+    try {
+      const r = await fetch(`${conf.baseUrl}/api/pull`, {
+        method: 'POST', signal: controller.signal,
+        headers: { 'content-type': 'application/json', ...(conf.key ? { authorization: `Bearer ${conf.key}` } : {}) },
+        body: JSON.stringify({ model, stream: true }),
+      });
+      if (!r.ok) throw new Error((await r.text()).slice(0, 300) || `Ollama answered ${r.status}`);
+      let buf = '', last = 0;
+      for await (const chunk of r.body) {
+        buf += Buffer.from(chunk).toString('utf8');
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim();
+          buf = buf.slice(i + 1);
+          if (!line) continue;
+          const ev = JSON.parse(line);
+          if (ev.error) throw new Error(ev.error);
+          if (Date.now() - last > 500 || ev.status === 'success') { last = Date.now(); send({ status: ev.status, completed: ev.completed, total: ev.total }); }
+        }
+      }
+      send({ status: 'success', done: true });
+      await readiness.refresh();
+    } catch (e) {
+      send({ status: 'error', error: e.name === 'AbortError' ? 'Cancelled' : e.message, done: true });
+    } finally { pulls.delete(model); }
+  })();
+});
+admin.delete('/ollama/pull/:model', (req, res) => {
+  pulls.get(req.params.model)?.abort();
+  res.json({ ok: true });
 });
 
 admin.post('/notify/test', async (req, res) => {
@@ -249,12 +312,13 @@ app.use((err, req, res, next) => {
 });
 
 scheduler.start();
+readiness.start();
 const server = app.listen(cfg.port, cfg.host, () => {
   console.log(`Nightshift ${pkg.version} on http://${cfg.host}:${cfg.port}${cfg.password ? ' (password protected)' : ''}`);
   console.log(`API at /${API_VERSION}, data in ${cfg.dataDir}`);
 });
 for (const sig of ['SIGINT', 'SIGTERM']) {
-  process.on(sig, () => { scheduler.stop(); store.flush(); server.close(); process.exit(0); });
+  process.on(sig, () => { scheduler.stop(); readiness.stop(); store.flush(); server.close(); process.exit(0); });
 }
 
 export { app, store, scheduler };

@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Nightshift API
-  version: "2.0.0"
-  summary: Queue messages for Claude, OpenAI and Gemini, to send later or when a usage limit resets.
+  version: "2.1.0"
+  summary: Queue messages for Claude, OpenAI, Gemini and Ollama, to send later or when a usage limit resets.
   description: |
     Everything the Nightshift web app does goes through this API. The browser uses a
     session cookie; other tools use an API token created in Settings.
@@ -23,6 +23,7 @@ tags:
   - name: Sessions
   - name: Attachments
   - name: Messages
+  - name: Import and export
 
 paths:
   /healthz:
@@ -70,9 +71,13 @@ paths:
       summary: Models the provider reports
       parameters:
         - { name: provider, in: query, required: true, schema: { $ref: "#/components/schemas/ProviderId" } }
+        - { name: refresh, in: query, schema: { type: boolean }, description: "Fetch again instead of using the ten-minute cache" }
       responses:
+        "502": { description: "The provider could not be reached and nothing was cached", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "200":
           description: Model list, empty when the provider has no key
+          headers:
+            X-Models-Cached-At: { schema: { type: integer }, description: "When the list was fetched, epoch ms" }
           content:
             application/json:
               schema:
@@ -200,6 +205,112 @@ paths:
       responses:
         "200": { description: "Session transcript" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/sessions/{id}/export:
+    get:
+      tags: [Import and export]
+      summary: Download a Claude Code session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: format, in: query, schema: { type: string, enum: [md, json, jsonl], default: md } }
+        - { name: tz, in: query, schema: { type: string }, description: "IANA timezone for Markdown timestamps" }
+      responses:
+        "200":
+          description: The transcript
+          content:
+            text/markdown: {}
+            application/json: {}
+            application/x-ndjson: {}
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/conversations/{id}/export:
+    get:
+      tags: [Import and export]
+      summary: Download one conversation
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: format, in: query, schema: { type: string, enum: [md, json], default: md } }
+        - { name: attachments, in: query, schema: { type: boolean, default: true }, description: "JSON only: inline attachments as base64" }
+        - { name: tz, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The conversation
+          content:
+            text/markdown: {}
+            application/json: {}
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/export:
+    get:
+      tags: [Import and export]
+      summary: Download every conversation
+      parameters:
+        - { name: format, in: query, schema: { type: string, enum: [json, md], default: json }, description: "md gives a zip of Markdown files" }
+        - { name: provider, in: query, schema: { $ref: "#/components/schemas/ChatProviderId" } }
+        - { name: attachments, in: query, schema: { type: boolean, default: false } }
+        - { name: tz, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: The export
+          content:
+            application/json: {}
+            application/zip: {}
+
+  /v1/import:
+    post:
+      tags: [Import and export]
+      summary: Import exports from ChatGPT, Claude, Gemini, AI Studio, Claude Code or Nightshift
+      parameters:
+        - { name: preview, in: query, schema: { type: boolean, default: false }, description: "Return what was found and an id to commit, instead of importing" }
+        - { name: gap_minutes, in: query, schema: { type: integer, default: 30, minimum: 1, maximum: 1440 }, description: "Gemini Takeout: prompts closer than this form one conversation" }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              allOf:
+                - type: object
+                  required: [files]
+                  properties:
+                    files: { type: array, items: { type: string, format: binary } }
+                - $ref: "#/components/schemas/ImportOptions"
+      responses:
+        "201":
+          description: With preview, an ImportPreview; otherwise an ImportResult
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ImportPreview"
+                  - $ref: "#/components/schemas/ImportResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/import/{id}/commit:
+    post:
+      tags: [Import and export]
+      summary: Import a previewed upload
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ImportOptions" }
+      responses:
+        "200":
+          description: What was created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImportResult" }
+        "404": { description: "The preview expired" }
+
+  /v1/import/{id}:
+    delete:
+      tags: [Import and export]
+      summary: Discard a preview
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Discarded" }
 
   /v1/uploads:
     post:
@@ -360,6 +471,8 @@ paths:
                 delay_seconds: { type: integer }
                 retry_on_limit: { type: boolean }
                 webhook_url: { type: string, format: uri }
+                repeat: { type: string, enum: [none, daily, weekdays, weekly], description: "First message of a chain only. none stops repeating" }
+                timezone: { type: string }
       responses:
         "200":
           description: Updated
@@ -410,7 +523,7 @@ paths:
         - { name: token, in: query, schema: { type: string }, description: "API token, for clients that cannot set headers" }
       responses:
         "200":
-          description: An event stream of job, jobRemoved, limits, live and conversation events
+          description: An event stream of job, jobRemoved, limits, live, conversation, providers and pull events
           content:
             text/event-stream: {}
 
@@ -441,11 +554,11 @@ components:
 
     ProviderId:
       type: string
-      enum: [anthropic, claude-code, openai, gemini]
+      enum: [anthropic, claude-code, openai, gemini, ollama]
 
     ChatProviderId:
       type: string
-      enum: [anthropic, openai, gemini]
+      enum: [anthropic, openai, gemini, ollama]
 
     Effort:
       type: string
@@ -473,6 +586,8 @@ components:
         label: { type: string }
         kind: { type: string, enum: [chat, agent] }
         ready: { type: boolean }
+        status_note: { type: string, description: "Why it is or is not ready, for display" }
+        key_optional: { type: boolean, description: "Works without a key, like Ollama" }
         efforts: { type: array, items: { type: string } }
         caps:
           type: object
@@ -501,6 +616,12 @@ components:
         messageCount: { type: integer }
         createdAt: { type: integer }
         updatedAt: { type: integer }
+        source:
+          type: object
+          description: Set on imported conversations
+          properties:
+            kind: { type: string, enum: [chatgpt, claude, gemini, aistudio, claude-code, nightshift, backup] }
+            id: { type: string }
 
     StoredMessage:
       type: object
@@ -542,6 +663,8 @@ components:
         max_tokens: { type: integer }
         mode: { $ref: "#/components/schemas/Mode" }
         run_at: { type: [integer, string], description: "Epoch milliseconds or an ISO timestamp" }
+        repeat: { type: string, enum: [daily, weekdays, weekly], description: "Repeat the whole chain. Needs mode at or now" }
+        timezone: { type: string, description: "IANA timezone the repeat keeps its wall-clock time in. Default: the server's" }
         retry_on_limit: { type: boolean, default: true }
         webhook_url: { type: string, format: uri }
         text: { type: string, description: "A single message, as an alternative to messages[]" }
@@ -574,6 +697,13 @@ components:
         runAt: { type: [integer, "null"] }
         delayMs: { type: integer }
         dependsOn: { type: [string, "null"], description: "The message this one waits for" }
+        chainId: { type: string }
+        repeat:
+          type: object
+          properties:
+            every: { type: string, enum: [daily, weekdays, weekly] }
+            timezone: { type: string }
+        repeatedBy: { type: string, description: "The next occurrence, once queued" }
         threadKey: { type: string }
         conversationId: { type: string }
         sessionId: { type: [string, "null"] }
@@ -603,3 +733,46 @@ components:
             sessionId: { type: string }
             costUsd: { type: number }
             note: { type: string }
+
+    ImportOptions:
+      type: object
+      properties:
+        keys: { type: array, items: { type: string }, description: "Which conversations, by key. Default: all not already imported" }
+        provider: { $ref: "#/components/schemas/ChatProviderId" }
+        target: { type: string, enum: [conversations, claude-code], default: conversations }
+        cwd: { type: string, description: "With target claude-code: install sessions for this project folder" }
+        restore_settings: { type: boolean, default: false, description: "Backups, signed-in session only" }
+
+    ImportPreview:
+      type: object
+      properties:
+        id: { type: string }
+        expiresAt: { type: integer }
+        sources: { type: array, items: { type: object, properties: { id: { type: string }, label: { type: string } } } }
+        warnings: { type: array, items: { type: string } }
+        backup: { type: [object, "null"] }
+        conversations:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              source: { type: string }
+              title: { type: string }
+              messages: { type: integer }
+              files: { type: integer }
+              provider: { $ref: "#/components/schemas/ProviderId" }
+              model: { type: string }
+              createdAt: { type: integer }
+              updatedAt: { type: integer }
+              alreadyImported: { type: boolean }
+              cwd: { type: string }
+
+    ImportResult:
+      type: object
+      properties:
+        conversations: { type: array, items: { type: object, properties: { id: { type: string }, title: { type: string }, provider: { type: string }, messages: { type: integer } } } }
+        sessions: { type: array, items: { type: object, properties: { id: { type: string }, title: { type: string }, cwd: { type: string } } } }
+        skipped: { type: integer }
+        errors: { type: array, items: { type: string } }
+        restored: { type: [object, "null"] }

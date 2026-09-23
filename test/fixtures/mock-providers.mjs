@@ -1,7 +1,7 @@
 import http from 'node:http';
 
 /**
- * A stand-in for all three chat APIs, so tests never touch the network.
+ * A stand-in for every chat API, so tests never touch the network.
  * Anthropic's first call answers 429 with retry-after, which is how the
  * "wait for the reset" path gets exercised.
  */
@@ -66,6 +66,32 @@ export function startMockProviders({ anthropicLimitOnce = false, retryAfter = 3 
           { candidates: [{ content: { parts: [{ text }] } }] },
           { candidates: [{ content: { parts: [] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 8, candidatesTokenCount: 3 } },
         ]);
+      }
+      // ----- Ollama (native API, newline-delimited JSON) -----
+      if (p === '/ollama/api/tags') {
+        return send(200, { models: [
+          { name: 'llama-test:latest', model: 'llama-test:latest', size: 2e9, modified_at: '2026-09-01T10:00:00Z', details: { parameter_size: '3B', quantization_level: 'Q4_K_M' } },
+          { name: 'no-think:latest', model: 'no-think:latest', size: 1e9, modified_at: '2026-08-01T10:00:00Z', details: {} },
+        ] });
+      }
+      if (p === '/ollama/api/chat') {
+        if (json.think !== undefined && json.model.startsWith('no-think')) return send(400, { error: `"${json.model}" does not support thinking` });
+        if (json.model === 'missing') return send(404, { error: "model 'missing' not found" });
+        const last = json.messages[json.messages.length - 1];
+        const text = `ollama reply to: ${last.content}${last.images?.length ? ` (+${last.images.length} image)` : ''}`;
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        const half = Math.ceil(text.length / 2);
+        res.write(JSON.stringify({ model: json.model, message: { role: 'assistant', content: text.slice(0, half) }, done: false }) + '\n');
+        res.write(JSON.stringify({ model: json.model, message: { role: 'assistant', content: text.slice(half) }, done: false }) + '\n');
+        res.write(JSON.stringify({ model: json.model, message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop', prompt_eval_count: 12, eval_count: 5 }) + '\n');
+        return res.end();
+      }
+      if (p === '/ollama/api/pull') {
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+        res.write(JSON.stringify({ status: 'pulling manifest' }) + '\n');
+        res.write(JSON.stringify({ status: 'downloading', completed: 50, total: 100 }) + '\n');
+        res.write(JSON.stringify({ status: 'success' }) + '\n');
+        return res.end();
       }
       send(404, { error: `no mock route for ${p}` });
     });

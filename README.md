@@ -5,7 +5,7 @@
   <img src="docs/assets/logo-light.svg" alt="Nightshift" width="340">
 </picture>
 
-### Queue messages for Claude, OpenAI and Gemini. They send at the time you pick, or the moment your usage limit resets.
+### Queue messages for Claude, OpenAI, Gemini and Ollama. They send at the time you pick, or the moment your usage limit resets.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-1F8A70)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-4338CA)](https://nodejs.org)
@@ -18,7 +18,7 @@
 
 ---
 
-Your limit runs out at 11 PM and resets at 3 AM. Nightshift is a small self-hosted web app that holds your messages and sends them the second the limit lifts, so the work happens while you sleep. It talks to Claude Code, the Claude API, OpenAI and Gemini, and everything it does from the browser it can also do over a REST API, so n8n, cron, Home Assistant or your own scripts can drive it.
+Your limit runs out at 11 PM and resets at 3 AM. Nightshift is a small self-hosted web app that holds your messages and sends them the second the limit lifts, so the work happens while you sleep. It talks to Claude Code, the Claude API, OpenAI, Gemini and your own Ollama models, and everything it does from the browser it can also do over a REST API, so n8n, cron, Home Assistant or your own scripts can drive it.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshot-dark.png">
@@ -30,13 +30,15 @@ Your limit runs out at 11 PM and resets at 3 AM. Nightshift is a small self-host
 | | |
 |---|---|
 | **Send when the limit resets** | Reads the reset time out of Claude Code's limit message or the API's rate-limit headers, and sends the moment it lifts, with a countdown in the header |
-| **Send at a time you pick** | Any date and time, in your own timezone |
+| **Send at a time you pick** | Any date and time, in your own timezone, once or every day, weekday or week |
 | **Chain messages** | Queue several in a row; each waits for the reply before it, the way a person would |
 | **Edit and delete** | Change the text, model, effort or timing of anything still waiting, or drop it and the chain re-links itself |
-| **Four backends** | Claude Code (your Pro or Max plan), the Claude API, OpenAI, and Gemini, side by side |
+| **Five backends** | Claude Code (your Pro or Max plan), the Claude API, OpenAI, Gemini and Ollama, side by side, with each provider's real model list in a dropdown |
+| **Import and export** | Bring in your ChatGPT, Claude, Gemini, AI Studio and Claude Code history and carry on in any provider; export any conversation as Markdown or JSON, or back up everything in one zip |
 | **Attachments** | Images, PDFs, code, text and video, by drag and drop, paste or file picker |
 | **REST API** | Tokens, webhooks, long polling and live events, for orchestration tools |
 | **Alerts** | ntfy, Discord, Slack or browser notifications when something sends or fails |
+| **Small touches** | Copy buttons on replies and code blocks, and a first screen that opens on whichever provider is actually ready |
 
 > [!NOTE]
 > There is no claude.ai integration, because claude.ai has no public API. Automating it means replaying your browser session against private endpoints, which breaks without warning and goes against Anthropic's Consumer Terms. Claude Code is the supported way to use a Pro or Max subscription from a script, and it draws on the same plan, so queuing through the Claude Code tab covers the 3 AM reset.
@@ -50,14 +52,14 @@ npm install
 npm start          # http://127.0.0.1:8787
 ```
 
-Or with Docker, which brings Claude Code and ffmpeg along:
+Or with Docker, which brings Claude Code and ffmpeg along, and Ollama too if you want it:
 
 ```bash
-cp .env.example .env     # set APP_PASSWORD
+cp .env.example .env     # set APP_PASSWORD; uncomment COMPOSE_PROFILES=ollama for local models
 docker compose up -d --build
 ```
 
-Add the keys you want in **Settings**. Claude Code signs in on its own with `claude`; the other three take an API key. Full instructions, including reverse proxies and access from your phone, are in [Getting started](docs/getting-started.md).
+Add the keys you want in **Settings**. Claude Code signs in on its own with `claude`, Ollama needs no key, and the other three take an API key. Full instructions, including reverse proxies and access from your phone, are in [Getting started](docs/getting-started.md).
 
 ## Queue a message from a script
 
@@ -101,7 +103,7 @@ The details, including how reset times are read out of each provider, are in [Ar
 
 - [Getting started](docs/getting-started.md) — install, Docker, remote access, updating
 - [Configuration](docs/configuration.md) — every environment variable and setting
-- [Usage](docs/usage.md) — providers, scheduling, chains, attachments, notifications
+- [Usage](docs/usage.md) — providers, scheduling, repeats, chains, attachments, import and export, notifications
 - [REST API](docs/api.md) — endpoints, tokens, webhooks, recipes, plus the [OpenAPI spec](docs/openapi.yaml)
 - [Architecture](docs/architecture.md) — how the scheduler, providers and storage work
 - [Security](docs/security.md) — what this app can reach, and how to lock it down
@@ -113,13 +115,20 @@ The details, including how reset times are read out of each provider, are in [Ar
 ```
 server.js                     HTTP server, sign-in, admin routes
 lib/api.js                    the /v1 REST API, shared by the browser and by scripts
-lib/jobs.js                   validation, chains, editing
-lib/scheduler.js              the queue: limit waits, retries, webhooks
+lib/jobs.js                   validation, chains, repeats, editing
+lib/scheduler.js              the queue: limit waits, retries, repeats, webhooks
+lib/readiness.js              which providers are set up and reachable, rechecked every minute
+lib/time.js                   timezones and the next occurrence of a repeat, DST-safe
+lib/importers.js              ChatGPT, Claude, Gemini, AI Studio, Claude Code and backup imports
+lib/exporters.js              Markdown, JSON and backup exports
+lib/zip.js                    a small zip reader and writer, no dependencies
+lib/files.js                  storing uploads and imported attachments
 lib/providers/
   chat.js                     one runner for every HTTP chat provider
   anthropic.js                request, stream and error shapes per provider
   openai.js
   gemini.js
+  ollama.js                   native Ollama chat, model list and pulls
   claudeCode.js               headless runs, session history, reset-time parsing
   index.js                    the registry the rest of the app sees
 lib/media.js                  file typing, ffmpeg frames, image conversion
@@ -137,7 +146,7 @@ test/                         unit and end-to-end tests against mock providers
 npm test
 ```
 
-The suite starts the real server against mock Anthropic, OpenAI and Gemini endpoints and a fake Claude Code CLI, then checks the things that are easy to get wrong: waiting out a 429, resuming a Claude Code session, chains running in order, and edits and deletes re-linking a chain. No network and no API keys needed.
+The suite starts the real server against mock Anthropic, OpenAI, Gemini and Ollama endpoints and a fake Claude Code CLI, then checks the things that are easy to get wrong: waiting out a 429, resuming a Claude Code session, chains running in order, edits and deletes re-linking a chain, repeats landing on the right day across daylight saving changes, and every import format round-tripping. No network and no API keys needed.
 
 </details>
 

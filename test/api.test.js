@@ -56,6 +56,7 @@ before(async () => {
       ANTHROPIC_BASE_URL: `${mock.base}/anthropic`,
       OPENAI_BASE_URL: `${mock.base}/openai`,
       GEMINI_BASE_URL: `${mock.base}/gemini`,
+      OLLAMA_BASE_URL: `${mock.base}/ollama`,
       CLAUDE_BIN: path.join(root, 'test/fixtures/fake-claude.mjs'),
       CLAUDE_CWD: dataDir,
       CLAUDE_CONFIG_DIR: path.join(dataDir, 'claude'),
@@ -101,7 +102,7 @@ test('an API token can read the service, and cannot manage tokens', async () => 
 
 test('lists every provider with its capabilities', async () => {
   const providers = await api('/v1/providers');
-  assert.deepEqual(providers.map(p => p.id).sort(), ['anthropic', 'claude-code', 'gemini', 'openai']);
+  assert.deepEqual(providers.map(p => p.id).sort(), ['anthropic', 'claude-code', 'gemini', 'ollama', 'openai']);
   assert.equal(providers.find(p => p.id === 'openai').ready, true);
   assert.equal(providers.find(p => p.id === 'gemini').caps.video, 'native');
 });

@@ -31,6 +31,8 @@ Nightshift holds your API keys, and through Claude Code it can run commands and 
 - API tokens are stored as SHA-256 hashes; the plaintext is shown once, at creation.
 - Tokens cannot read or change settings, or create other tokens.
 - Keys are never sent to the browser. The UI sees only the last four characters.
+- Backups leave keys and token hashes out unless you ask for them, and downloading one needs a signed-in session, not a token. A backup with keys is as sensitive as `data/db.json`.
+- Imports are parsed without executing anything; zip entries are read by name only, never extracted to paths taken from the archive. Installing a Claude Code session writes only under `~/.claude/projects/`.
 
 ## Other hardening in the app
 

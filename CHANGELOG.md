@@ -4,6 +4,24 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-23
+
+### Added
+- **Ollama** provider, native and keyless, with model pulls from Settings (live progress), `think` mapped from the effort control, and a hint to pull a model that is missing. Docker Compose reaches an Ollama on the host, or runs one alongside with `COMPOSE_PROFILES=ollama`.
+- **Model picker**: a real dropdown per provider, filled from its model list (cached ten minutes), with a refresh button and a **Custom…** option.
+- **Import** from the official data exports of ChatGPT, Claude, Gemini (Takeout) and AI Studio, from Claude Code session files, and from Nightshift's own exports. Zip or JSON, with a preview, per-conversation selection, and skipping of anything already imported.
+- **Export** any conversation as Markdown or JSON, a Claude Code session also as raw `.jsonl`, or everything at once.
+- **Backup and restore** in one zip, attachments included and keys only on request.
+- **Repeating schedules**: every day, every weekday or every week, DST-safe, whole chains included, with **Stop repeating**.
+- **Copy** buttons on replies and on code blocks, working over plain HTTP too.
+- Provider readiness: status per provider in Settings, rechecked every minute and pushed live, and a first screen that opens on a provider that is actually ready.
+- `.env.example` and `.gitignore`.
+- API: `GET /v1/conversations/{id}/export`, `GET /v1/sessions/{id}/export`, `GET /v1/export`, `POST /v1/import` (with preview and commit), `repeat` and `timezone` on messages, `status_note` and `key_optional` on providers, `?refresh=true` on models.
+
+### Changed
+- A later message scheduled in the same thread no longer holds up follow-ups that are due now.
+- The OpenAI provider's hint no longer suggests Ollama, which has its own provider.
+
 ## [2.0.0] - 2026-09-21
 
 ### Added
@@ -37,6 +55,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - Password protection, and a refusal to listen on the network without one.
 - Docker image with Claude Code and ffmpeg.
 
-[Unreleased]: https://github.com/whereixuezugi/nightshift/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/whereixuezugi/nightshift/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/whereixuezugi/nightshift/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/whereixuezugi/nightshift/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/whereixuezugi/nightshift/releases/tag/v1.0.0

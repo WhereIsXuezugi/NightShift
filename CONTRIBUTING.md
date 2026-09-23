@@ -16,12 +16,14 @@ There is no build step. The front end is plain HTML, CSS and JavaScript in `publ
 
 ## The tests
 
-`npm test` runs two suites:
+`npm test` runs four suites:
 
 - **`test/parse-limit.test.js`** — unit tests for reading reset times out of limit messages and rate-limit headers.
-- **`test/api.test.js`** — starts the real server against mock Anthropic, OpenAI and Gemini endpoints (`test/fixtures/mock-providers.mjs`) and a fake Claude Code CLI (`test/fixtures/fake-claude.mjs`), then drives it through the REST API.
+- **`test/unit.test.js`** — repeats across daylight saving changes, the zip reader and writer, import parsing and Markdown export, without a server.
+- **`test/api.test.js`** — starts the real server against mock Anthropic, OpenAI, Gemini and Ollama endpoints (`test/fixtures/mock-providers.mjs`) and a fake Claude Code CLI (`test/fixtures/fake-claude.mjs`), then drives it through the REST API.
+- **`test/features.test.js`** — the same harness (`test/fixtures/server.mjs`) for Ollama, every import format, exports, backup and restore, and repeating chains.
 
-Neither needs network access or API keys. A change to how the queue behaves should come with a test in `api.test.js`; a new limit-message format should come with a line in `parse-limit.test.js`, quoting the real message.
+None needs network access or API keys. A change to how the queue behaves should come with a test in `api.test.js`; a new limit-message format should come with a line in `parse-limit.test.js`, quoting the real message; a new import format should come with a small sample export in `features.test.js`.
 
 ## Where things live
 
@@ -33,10 +35,14 @@ Neither needs network access or API keys. A change to how the queue behaves shou
 | How one provider is spoken to | `lib/providers/<name>.js` |
 | Something every chat provider shares | `lib/providers/chat.js` |
 | Claude Code runs and sessions | `lib/providers/claudeCode.js` |
+| Whether a provider shows as ready | `lib/readiness.js`, and `probe()` in the adapter |
+| Repeating schedules | `lib/time.js`, then `repeatChain()` in `lib/scheduler.js` |
+| Reading another app's export | `lib/importers.js` |
+| Markdown, JSON and backup output | `lib/exporters.js` |
 
 ### Adding a provider
 
-Write an adapter next to the others: `request()` to build the call, `stream()` to read one event, `mapError()` to turn a failure into `limit`, `credit`, `overloaded` or `error` with a reset time when there is one, and `caps` to say which attachments it reads. Register it in `lib/providers/index.js`, add a route to the mock in `test/fixtures/mock-providers.mjs`, and a test. Nothing else in the app should need to change; if it does, that is worth mentioning in the pull request.
+Write an adapter next to the others: `request()` to build the call, `stream()` to read one event, `mapError()` to turn a failure into `limit`, `credit`, `overloaded` or `error` with a reset time when there is one, and `caps` to say which attachments it reads. Optionally, `listModels()` fills the model dropdown and `probe()` lets the app check it is reachable when it needs no key. Register it in `lib/providers/index.js`, add a route to the mock in `test/fixtures/mock-providers.mjs`, and a test. Nothing else in the app should need to change; if it does, that is worth mentioning in the pull request.
 
 ## Style
 

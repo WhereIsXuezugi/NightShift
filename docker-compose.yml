@@ -6,6 +6,13 @@ services:
     container_name: nightshift
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Where Ollama answers. The default reaches an Ollama running on the host;
+      # with the bundled service (COMPOSE_PROFILES=ollama) use http://ollama:11434.
+      # A base URL saved in Settings wins over this.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # Only reachable from this machine. Put a reverse proxy with HTTPS in front,
       # or use Tailscale, to reach it from your phone. See docs/getting-started.md.
@@ -15,5 +22,26 @@ services:
       - claude-home:/home/node/.claude    # Claude Code sign-in and session history
       - ./workspace:/workspace            # projects Claude Code may work in
 
+  # Optional local models. Start it with COMPOSE_PROFILES=ollama in .env
+  # (or `docker compose --profile ollama up -d`), and set
+  # OLLAMA_BASE_URL=http://ollama:11434. Pull models from Settings → Ollama.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: nightshift-ollama
+    profiles: ["ollama"]
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    # Not published on the host: only Nightshift talks to it.
+    # To use an NVIDIA GPU (needs the NVIDIA Container Toolkit), uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
 volumes:
   claude-home:
+  ollama:

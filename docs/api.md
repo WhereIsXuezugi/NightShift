@@ -13,7 +13,7 @@ export NIGHTSHIFT=http://127.0.0.1:8787
 export TOKEN=ns_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 curl -s $NIGHTSHIFT/v1/ping -H "Authorization: Bearer $TOKEN"
-# {"ok":true,"name":"nightshift","version":"2.0.0","api":"v1","now":1758400000000}
+# {"ok":true,"name":"nightshift","version":"2.1.0","api":"v1","now":1758400000000}
 ```
 
 `X-API-Key: <token>` works too. For `GET /v1/events`, where headers are awkward, `?token=` is accepted.
@@ -30,8 +30,8 @@ Request bodies accept `snake_case` or `camelCase`. Responses are `camelCase`.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/v1/ping` | Liveness and version |
-| `GET` | `/v1/providers` | Every provider, its readiness, capabilities, current limit and queue depth |
-| `GET` | `/v1/models?provider=` | Models the provider reports |
+| `GET` | `/v1/providers` | Every provider, its readiness (`ready`, `status_note`, `key_optional`), capabilities, current limit and queue depth |
+| `GET` | `/v1/models?provider=` | Models the provider reports, cached for ten minutes. `&refresh=true` fetches again; `X-Models-Cached-At` says when the list was fetched |
 | `POST` | `/v1/limits/{provider}/clear` | Declare a limit over and release what is waiting |
 | `GET` | `/healthz` | Unauthenticated liveness, for Docker and uptime checks |
 
@@ -46,6 +46,7 @@ Chat providers only. Claude Code uses its own sessions.
 | `GET` | `/v1/conversations/{id}` | Full history, with attachments |
 | `PATCH` | `/v1/conversations/{id}` | Change `title`, `system` or `model` |
 | `DELETE` | `/v1/conversations/{id}` | Delete, cancelling anything queued for it |
+| `GET` | `/v1/conversations/{id}/export?format=md\|json` | Download as Markdown, or as JSON with attachments inline (`&attachments=false` to leave them out). `&tz=Europe/Paris` sets the timezone of the Markdown timestamps |
 
 ### Claude Code sessions
 
@@ -53,6 +54,7 @@ Chat providers only. Claude Code uses its own sessions.
 |---|---|---|
 | `GET` | `/v1/sessions` | Sessions found on this machine, newest first |
 | `GET` | `/v1/sessions/{id}` | Transcript of one session |
+| `GET` | `/v1/sessions/{id}/export?format=md\|json\|jsonl` | Download the transcript, or the raw session file |
 
 ### Attachments
 
@@ -74,7 +76,18 @@ Chat providers only. Claude Code uses its own sessions.
 | `DELETE` | `/v1/jobs/{id}` | Delete; `?cascade=false` leaves the rest of the chain orphaned |
 | `POST` | `/v1/jobs/{id}/cancel` | Stop it, including mid-send |
 | `POST` | `/v1/jobs/{id}/retry` | Send now, ignoring a known limit |
-| `GET` | `/v1/events` | Server-sent events: `job`, `jobRemoved`, `limits`, `live`, `conversation` |
+| `GET` | `/v1/events` | Server-sent events: `job`, `jobRemoved`, `limits`, `live`, `conversation`, `providers`, `pull` |
+
+### Import and export
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/export?format=json\|md&provider=` | Every conversation: one JSON file (`&attachments=true` to inline files), or a zip of Markdown files by provider |
+| `POST` | `/v1/import` | Multipart, field `files`. Imports everything new straight away, or with `?preview=true` returns what it found and an id |
+| `POST` | `/v1/import/{id}/commit` | Import a previewed upload, optionally only some conversations |
+| `DELETE` | `/v1/import/{id}` | Discard a preview. Unused previews expire after 30 minutes |
+
+Full backups (`GET /api/backup`) and Ollama pulls (`POST /api/ollama/pull`) are admin routes and need a signed-in session, not a token.
 
 ## Queueing messages
 
@@ -82,7 +95,7 @@ Chat providers only. Claude Code uses its own sessions.
 
 ```jsonc
 {
-  "provider": "anthropic",            // anthropic | openai | gemini | claude-code
+  "provider": "anthropic",            // anthropic | openai | gemini | ollama | claude-code
   "conversation_id": "…",             // chat providers
   "cwd": "/srv/project",              // claude-code: the project folder
   "session_id": "…",                  // claude-code: resume an existing session
@@ -92,6 +105,8 @@ Chat providers only. Claude Code uses its own sessions.
   "max_tokens": 16000,
   "mode": "reset",                    // now | at | reset | after
   "run_at": "2026-09-21T03:30:00Z",   // mode "at": ISO string or epoch ms
+  "repeat": "weekdays",               // daily | weekdays | weekly; needs mode "at" or "now"
+  "timezone": "Europe/London",        // for repeat; defaults to the server's
   "retry_on_limit": true,
   "webhook_url": "https://example.com/hook",
   "messages": [
@@ -111,6 +126,10 @@ A single message can skip the array entirely: `{ "provider": "openai", "conversa
 | `at` | At `run_at` |
 | `reset` | When that provider's limit lifts, or now if nothing is limited |
 | `after` | Once the message before it has a reply. The default for every message after the first |
+
+### Repeating
+
+With `repeat`, the first message carries `"repeat": { "every": "weekdays", "timezone": "Europe/London" }`. When it has run (or finally failed), the whole chain is queued again at the same wall-clock time on the next matching day, and the finished job's `repeatedBy` points at the new first message. To stop, `PATCH /v1/jobs/{id}` with `{ "repeat": "none" }` on the waiting first message, or delete it.
 
 The response is the jobs that were created, in order:
 
@@ -166,6 +185,45 @@ Set `webhook_url` on a message, and Nightshift `POST`s to it when the message fi
 ```
 
 `message.failed` has the same shape with `lastError` set. The call times out after 15 seconds and is not retried, so treat it as a nudge and read the job for the truth.
+
+## Importing
+
+```bash
+# See what an export holds before importing it
+curl -s $NIGHTSHIFT/v1/import?preview=true -H "Authorization: Bearer $TOKEN" \
+  -F files=@chatgpt-export.zip
+```
+
+```jsonc
+{
+  "id": "…", "expiresAt": 1758401800000,
+  "sources": [ { "id": "chatgpt", "label": "ChatGPT" } ],
+  "warnings": [],
+  "backup": null,                       // set when the upload is a Nightshift backup
+  "conversations": [
+    { "key": "chatgpt:6f1…", "title": "Trip planning", "messages": 14, "files": 2,
+      "provider": "openai", "model": "gpt-4o", "createdAt": 1717000000000, "alreadyImported": false }
+  ]
+}
+```
+
+Then commit, with any of these optional fields:
+
+```bash
+curl -s -X POST $NIGHTSHIFT/v1/import/<id>/commit -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "keys": ["chatgpt:6f1…"], "provider": "anthropic" }'
+```
+
+| Field | Meaning |
+|---|---|
+| `keys` | Which conversations. Default: all not already imported |
+| `provider` | Put them all under this provider instead of the one they came from |
+| `target` | For Claude Code sessions: `"claude-code"` installs them as sessions Claude Code can resume, `"conversations"` (default) makes chat conversations |
+| `cwd` | With `target: "claude-code"`, the project folder to install into |
+| `restore_settings` | For a backup, and a signed-in session only: overwrite settings too |
+
+The result lists what was created: `{ "conversations": [...], "sessions": [...], "skipped": 0, "errors": [], "restored": null }`. Without `?preview=true`, `POST /v1/import` takes the same fields as form fields and commits at once. Gemini Takeout accepts `gap_minutes` (default 30) for how far apart two prompts can be and still count as one conversation.
 
 ## Recipes
 

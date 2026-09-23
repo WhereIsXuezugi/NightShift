@@ -39,7 +39,23 @@ Open the queue and read the card. The status line says where it is, and a failur
 
 **Effort seems ignored.** If a model rejects it, the message is sent again without it and the card says so.
 
+**Ollama says "Not reachable".** Check `curl http://127.0.0.1:11434/api/tags` from where Nightshift runs. In Docker, an Ollama on the host has to listen on `0.0.0.0`, not just localhost; see [Ollama in Docker](getting-started.md#ollama-in-docker). With the bundled service, `OLLAMA_BASE_URL` must be `http://ollama:11434` and `COMPOSE_PROFILES=ollama` set.
+
+**Ollama: "model not found".** The model has not been pulled on that Ollama. Pull it in **Settings → Ollama**, or pick one from the dropdown, which lists only what is installed.
+
+**The model dropdown is empty or old.** Press the refresh button beside it; lists are cached for ten minutes. If the provider cannot be reached, **Custom…** lets you type a name anyway.
+
 **Gemini 429 straight away.** Free-tier quotas are daily as well as per-minute. The card shows the retry delay Google reports.
+
+## Import and export
+
+**"Nothing importable found".** Upload the zip exactly as the service sent it, or the `conversations.json` inside. For Gemini, Takeout must include *My Activity → Gemini Apps*; the *Gemini* folder alone holds only Gems. Very large exports are fine up to 8 GB.
+
+**A ChatGPT conversation looks shorter than in the app.** Only the branch you last viewed is imported; edited-away branches are skipped, as are tool calls and hidden messages.
+
+**Imported the same export twice.** Conversations already imported are detected and skipped, so nothing is duplicated.
+
+**A restored message did not send.** Queued work from a backup comes back cancelled on purpose. Open it and press **Send now**, or edit its time.
 
 ## The app itself
 

@@ -1,6 +1,6 @@
 {
   "name": "nightshift",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Self-hosted message scheduler for Claude, OpenAI and Gemini. Queue messages for a set time or the moment your usage limit resets, with a REST API for orchestration.",
   "type": "module",
   "main": "server.js",
@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test/parse-limit.test.js test/api.test.js",
+    "test": "node --test test/parse-limit.test.js test/unit.test.js test/api.test.js test/features.test.js",
     "check": "node --check server.js"
   },
   "dependencies": {
